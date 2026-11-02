@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## 0.1.3 · 2026-11-02
+
+- 修正镜像构建：`gx adm v_patch` 只改 `Cargo.toml`，`Cargo.lock` 未同步，`--locked` 直接失败；
+  已同步锁文件，并让 CI 也带 `--locked`，同类漂移以后在 CI 就会暴露。
+
 ## 0.1.2 · 2026-11-02
 
 - `[sink.tokens]` 的**键**也支持 `${SEC_...}`：站点 token 不再需要以明文写进配置文件

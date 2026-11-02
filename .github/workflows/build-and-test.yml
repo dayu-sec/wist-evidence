@@ -36,12 +36,13 @@ jobs:
         run: cargo fmt --check
 
       # 全 feature 体检：把 PG / COS 两条生产后端也过一遍静态检查。
+      # `--locked`：防止 gx 升版本后 Cargo.lock 与 Cargo.toml 不一致（镜像里也带 --locked，会直接失败）。
       - name: Cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       # 契约测试跑内存后端：不依赖 PG、COS，几秒出结果。
       - name: Cargo test (memory backends)
-        run: cargo test --no-default-features --all-targets
+        run: cargo test --locked --no-default-features --all-targets
 
       # 生产默认构建：验证 pg + s3 两条 feature 真能一起编过。
       - name: Cargo build (release, default features)
