@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## 0.1.1 · 2026-11-02
+
+- 新增 `GET /internal/evidence` 列表接口：时间倒序，支持 `kind` / `subject_id` / `since` 筛选；
+  列表同样受 scope、`max_sensitivity`、状态与保留期约束，跨租户返回空列表（不泄露存在性）。
+- 发布镜像（ghcr，`linux/amd64` + `linux/arm64`），供计算区 stack 按固定 tag 拉取；
+  Dockerfile 改为多阶段镜像内构建（与 `wist-atlas` 同构），不再依赖 `dist/`。
+
 ## 0.1.0 · 2026-11-02
 
 首个骨架：证据服务 P0（索引 + sink 写入 + 元数据读 + 短签名）。

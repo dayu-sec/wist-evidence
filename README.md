@@ -112,13 +112,14 @@ systemctl daemon-reload && systemctl enable --now wist-evidence
 
 ### 容器
 
-镜像**不在里面编译**（多架构 buildx 下 arm64 走 QEMU，构建时间不可接受），
-而是按 `$TARGETARCH` 取 CI 产出的静态 musl 二进制：
+镜像**在镜像内构建**（多阶段，与 `wist-atlas` 同构）：
 
 ```bash
-# dist/<arm64|amd64>/ 里要有二进制 + version.txt
-mkdir -p dist/arm64 && cp target/aarch64-unknown-linux-musl/release/wist-evidence version.txt dist/arm64/
+# 本机架构（开发）
 docker build -t wist-evidence:dev .
+
+# 多架构（CI 的 release 流水线自动做：linux/amd64 + linux/arm64）
+docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/dayu-sec/wist-evidence:dev .
 
 docker run --rm -p 8080:8080 -p 8443:8443 \
   -v /etc/wist-evidence:/etc/wist-evidence:ro \
@@ -129,6 +130,9 @@ docker run --rm -p 8080:8080 -p 8443:8443 \
 
 端口约定：`8080` = 写（明文，只在内网）/ `8443` = 读。读端点 P0 靠内网 TLS 终结层保护，
 服务自带的 mTLS 在 P1 接入（设计稿 §16 / §19-10）。
+
+镜像是 stack（`wist-console-stack`）的交付物，按固定 tag 拉取；镜像的 GLIBC 与健康检查
+debian + busybox 口径与 atlas / ingest 保持一致。
 
 ## 待真机验证（不要当成已完成）
 
