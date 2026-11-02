@@ -1,0 +1,46 @@
+name: Build & Test
+
+on:
+  push:
+    branches:
+      - "*"
+  pull_request:
+    types: [opened, reopened]
+    branches:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cargo fmt
+        run: cargo fmt --check
+
+      # 全 feature 体检：把 PG / COS 两条生产后端也过一遍静态检查。
+      - name: Cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # 契约测试跑内存后端：不依赖 PG、COS，几秒出结果。
+      - name: Cargo test (memory backends)
+        run: cargo test --no-default-features --all-targets
+
+      # 生产默认构建：验证 pg + s3 两条 feature 真能一起编过。
+      - name: Cargo build (release, default features)
+        run: cargo build --release

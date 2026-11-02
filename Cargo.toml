@@ -1,0 +1,56 @@
+[package]
+name = "wist-evidence"
+version = "0.1.0" #@gxl:set(version)
+edition = "2024"
+license = "Apache-2.0"
+authors = ["wist Dev Team"]
+description = "wist 证据服务：动作产物的统一落点（索引 / 授权 / 短签名 / 保留）"
+readme = "README.md"
+
+# 默认把生产后端也编进去：`cargo build --release` 出来就是能接 PG + COS 的二进制。
+# 只做契约测试 / 本地联调时用 `--no-default-features`（内存索引 + 内存对象）。
+[features]
+default = ["pg", "s3"]
+pg = ["dep:sqlx"]
+s3 = ["dep:aws-sdk-s3"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+env_logger = "0.11"
+hex = "0.4"
+log = "0.4"
+# 配置里的 `${SEC_...}` 变量解析：与 center / gateway / gwlinkd 同口径。
+orion-sec = "0.7"
+orion-variate = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "signal",
+    "time",
+    "sync",
+    "fs",
+] }
+toml = "1.1"
+uuid = { version = "1", features = ["v7"] }
+zstd = "0.13"
+
+sqlx = { version = "0.9", optional = true, default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "chrono",
+    "json",
+    "macros",
+    "migrate",
+] }
+aws-sdk-s3 = { version = "1", optional = true }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

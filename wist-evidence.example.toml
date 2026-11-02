@@ -1,0 +1,36 @@
+# wist-evidence 示例配置（本地联调口径：内存索引 + 内存对象，重启即丢）
+#
+# 生产口径见 README「构建」：`index.kind = "postgres"`、`objects.kind = "s3"`，
+# 并用 `${SEC_...}` 引用密钥（由 `WIST_EVIDENCE_SEC_FILE` 指向的 YAML 提供）。
+
+# ── 写面：数据面 http_sink 直投（明文，只绑内网）────────────────────────────
+[sink]
+listen_addr = "127.0.0.1:19173"
+max_body_bytes = 4194304
+# P0 只开调查报告；`diagnose_report` 等加进这个列表即可（枚举已就绪）。
+allowed_kinds = ["investigation_report"]
+
+# 站点 token → 租户。**每站点一个**，服务端映射 tenant_id / customer_id。
+# 生产：token 从 `${SEC_EVIDENCE_SINK_TOKENS_<SITE>}` 来，不写在仓库里。
+[sink.tokens.tok_dev]
+tenant_id = "t-001"
+customer_id = "c-001"
+
+# ── 读面：内部服务（mTLS + scope；P0 由 TLS 终结层注入身份头）────────────────
+[read]
+listen_addr = "127.0.0.1:19174"
+
+# ── 索引 ─────────────────────────────────────────────────────────────────────
+[index]
+kind = "memory" # memory | postgres
+# database_url = "${SEC_EVIDENCE_DB_URL}"
+
+# ── 对象存储 ─────────────────────────────────────────────────────────────────
+[objects]
+kind = "memory" # memory | s3
+bucket = "wist-evidence-dev"
+# 生产（COS / MinIO，S3 兼容）：
+# endpoint = "${SEC_COS_ENDPOINT}"
+# region = "${SEC_COS_REGION}"
+# access_key = "${SEC_COS_SECRET_ID}"
+# secret_key = "${SEC_COS_SECRET_KEY}"

@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build-matrix:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux 出**静态 musl**：制品会被抽出到宿主原生运行，不能绑宿主 glibc 版本。
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cargo build
+        # ring / zstd 等 C 依赖按 target 取 CC；Rust 侧链接器指向 musl-gcc 才能真静态。
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          AR_x86_64_unknown_linux_musl: ar
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          AR_aarch64_unknown_linux_musl: ar
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package artifacts
+        run: |
+          set -euo pipefail
+          ARTIFACT="wist-evidence-${{ github.ref_name }}-${{ matrix.target }}"
+          BIN_DIR="target/${{ matrix.target }}/release"
+          test -x "${BIN_DIR}/wist-evidence" || { echo "拒绝打包：wist-evidence 缺失或不可执行" >&2; exit 1; }
+          mkdir -p "${ARTIFACT}"
+          cp -av "${BIN_DIR}/wist-evidence" "${ARTIFACT}/"
+          # 配置样例随包走：现场先有可跑的样例，再去换成 `${SEC_...}`。
+          cp -av wist-evidence.example.toml "${ARTIFACT}/"
+          tar -czf "${ARTIFACT}.tar.gz" "${ARTIFACT}"
+          LISTED="$(tar tzf "${ARTIFACT}.tar.gz")"
+          for f in wist-evidence wist-evidence.example.toml; do
+            case "${LISTED}" in
+              *"/${f}"*) echo "包内 ${f} ✓" ;;
+              *) echo "拒绝发布：${ARTIFACT}.tar.gz 里没有 ${f}" >&2; exit 1 ;;
+            esac
+          done
+          ls -lh "${ARTIFACT}.tar.gz"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wist-evidence-${{ github.ref_name }}-${{ matrix.target }}
+          path: wist-evidence-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [build-matrix]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: wist-evidence-*
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          # alpha/beta 通道标为 prerelease（不占 latest）；stable 才是正式版。
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}
+          generate_release_notes: true
+          files: artifacts/*.tar.gz
