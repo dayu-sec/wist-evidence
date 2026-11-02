@@ -1,0 +1,7 @@
+target
+dist
+.git
+.github
+_gal
+tests
+*.tar.gz

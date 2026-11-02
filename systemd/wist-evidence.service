@@ -1,0 +1,32 @@
+[Unit]
+Description=wist-evidence (evidence service: index / authz / presign / retention)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 不需要 root：读写对象存储走环境里的凭据，索引走 PG，磁盘只用于读配置。
+User=wisteve
+Group=wisteve
+
+# 配置与密钥同一口径（与 center / gwlinkd / ingest-ctrl 一致）：
+#   /etc/wist-evidence/wist-evidence.toml         ← 现场态，0640
+#   /etc/wist-evidence/.wist/sec-value.yml        ← ${SEC_...} 的真值，0640
+Environment=WIST_EVIDENCE_CONFIG=/etc/wist-evidence/wist-evidence.toml
+Environment=WIST_EVIDENCE_SEC_FILE=/etc/wist-evidence/.wist/sec-value.yml
+# 非密钥的现场覆盖（可选）：纯文本 KV，不要把 token 放这里。
+EnvironmentFile=-/etc/wist-evidence/wist-evidence.env
+
+ExecStart=/usr/local/bin/wist-evidence
+Restart=on-failure
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# 只有配置目录可读；写入点都在 PG / COS，不在本机。
+ReadOnlyPaths=/etc/wist-evidence
+
+[Install]
+WantedBy=multi-user.target

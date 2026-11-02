@@ -95,6 +95,41 @@ curl -sS -X POST 'http://127.0.0.1:19174/internal/evidence/art_...:presign' \
   -d '{"ttl_seconds":600}'
 ```
 
+## 部署
+
+### systemd（裸机 / VM）
+
+```bash
+install -D -m 0755 target/release/wist-evidence /usr/local/bin/wist-evidence
+install -D -m 0644 systemd/wist-evidence.service /etc/systemd/system/wist-evidence.service
+# 配置与密钥：属主=运行账号，0640
+install -D -m 0640 -o wisteve -g wisteve wist-evidence.toml /etc/wist-evidence/wist-evidence.toml
+systemctl daemon-reload && systemctl enable --now wist-evidence
+```
+
+单位文件里只用 `WIST_EVIDENCE_CONFIG` / `WIST_EVIDENCE_SEC_FILE` 两个环境变量；
+`${SEC_...}` 的真值放 `/etc/wist-evidence/.wist/sec-value.yml`，配置本身不含密钥。
+
+### 容器
+
+镜像**不在里面编译**（多架构 buildx 下 arm64 走 QEMU，构建时间不可接受），
+而是按 `$TARGETARCH` 取 CI 产出的静态 musl 二进制：
+
+```bash
+# dist/<arm64|amd64>/ 里要有二进制 + version.txt
+mkdir -p dist/arm64 && cp target/aarch64-unknown-linux-musl/release/wist-evidence version.txt dist/arm64/
+docker build -t wist-evidence:dev .
+
+docker run --rm -p 8080:8080 -p 8443:8443 \
+  -v /etc/wist-evidence:/etc/wist-evidence:ro \
+  -e WIST_EVIDENCE_CONFIG=/etc/wist-evidence/wist-evidence.toml \
+  -e WIST_EVIDENCE_SEC_FILE=/etc/wist-evidence/.wist/sec-value.yml \
+  wist-evidence:dev
+```
+
+端口约定：`8080` = 写（明文，只在内网）/ `8443` = 读。读端点 P0 靠内网 TLS 终结层保护，
+服务自带的 mTLS 在 P1 接入（设计稿 §16 / §19-10）。
+
 ## 待真机验证（不要当成已完成）
 
 1. **COS 预签名**：目前走 SDK 的 S3 SigV4。COS 是否接受这条预签名还没验过；
