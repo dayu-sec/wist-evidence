@@ -46,6 +46,7 @@ pub fn sink_router(state: SinkState, max_body_bytes: usize) -> Router {
 pub fn read_router(state: ReadState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/internal/evidence", get(read::list_evidence))
         .route(
             "/internal/evidence/{artifact_id}",
             get(read::metadata).post(read::presign_at),

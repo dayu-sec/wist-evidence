@@ -118,6 +118,28 @@ async fn get_metadata(read: &Router, tenant: &str, artifact_id: &str) -> StatusC
     read.clone().oneshot(request).await.unwrap().status()
 }
 
+async fn list(
+    read: &Router,
+    tenant: &str,
+    max_sensitivity: &str,
+    query: &str,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .uri(format!("/internal/evidence{query}"))
+        .header("x-evidence-tenant", tenant)
+        .header("x-evidence-scopes", "evidence:read")
+        .header("x-evidence-max-sensitivity", max_sensitivity)
+        .body(Body::empty())
+        .unwrap();
+    let response = read.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 async fn presign(read: &Router, artifact_id: &str, ttl: u64) -> (StatusCode, Value) {
     let request = Request::builder()
         .method("POST")
@@ -282,6 +304,41 @@ async fn object_metadata_carries_the_rebuild_fields() {
             "missing object meta {field}: {meta:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn list_returns_newest_first_and_respects_visibility() {
+    let h = harness();
+    post_record(&h.sink, TOKEN, sink_record("cmd-a", "warn")).await;
+    post_record(&h.sink, TOKEN, sink_record("cmd-b", "ok")).await;
+
+    let (status, page) = list(&h.read, "t-001", "paths", "").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let artifacts = page["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 2);
+    assert!(page["next_cursor"].is_null());
+
+    // 类型筛选
+    let (_, filtered) = list(&h.read, "t-001", "paths", "?kind=diagnose_report").await;
+    assert_eq!(filtered["artifacts"].as_array().unwrap().len(), 0);
+
+    // 跨租户：身份里没有 t-002 的数据 → 空列表（不是 403，避免泄露存在性）。
+    let (status, other) = list(&h.read, "t-002", "paths", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(other["artifacts"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn list_hides_artifacts_above_the_caller_sensitivity() {
+    let h = harness();
+    post_record(&h.sink, TOKEN, sink_record("cmd-c", "warn")).await; // sensitivity=paths
+
+    let (status, page) = list(&h.read, "t-001", "metrics", "").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["artifacts"].as_array().unwrap().len(), 0);
+
+    let (_, visible) = list(&h.read, "t-001", "paths", "").await;
+    assert_eq!(visible["artifacts"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]

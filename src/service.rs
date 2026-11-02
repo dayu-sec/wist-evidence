@@ -15,10 +15,13 @@ use serde::{Deserialize, Serialize};
 use crate::domain::Artifact;
 use crate::domain::artifact::{Durability, new_artifact_id, object_key};
 use crate::domain::kind::{Kind, RetentionClass, Sensitivity, Verdict, durability_from_str};
-use crate::infra::{Index, IndexError, ObjectMeta, ObjectStore, StoreError};
+use crate::infra::{Index, IndexError, ListFilter, ObjectMeta, ObjectStore, StoreError};
 
 /// 短签名有效期上限（D8）：预签名 URL 是 bearer token，必须短命 + 单对象。
 pub const MAX_PRESIGN_TTL: Duration = Duration::from_secs(60);
+
+/// 一次列表最多返回多少行（避免把浏览器/索引拖死）。
+pub const MAX_LIST_LIMIT: usize = 200;
 
 /// sink 调用方身份。来自 `Authorization` token → 服务端映射，**不是**请求体自述。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +122,12 @@ pub struct PresignOutcome {
     pub url: String,
     pub expires_in_seconds: u64,
     pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListPage {
+    pub artifacts: Vec<Artifact>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone)]
@@ -352,6 +361,51 @@ impl EvidenceService {
     ) -> Result<Artifact, ReadError> {
         let artifact = self.find_visible(principal, artifact_id).await?;
         Ok(artifact)
+    }
+
+    /// 时间倒序列表。`tenant_id` 必须落在调用方的租户集合里。
+    ///
+    /// 过滤顺序是「先按索引取，再按可见性筛」：为了少查一次，按 `limit + 1` 取，
+    /// 被敏感度/状态筛掉的行不占配额（代价是 `next_cursor` 可能比实际返回更靠后）。
+    pub async fn list(
+        &self,
+        principal: &ReadPrincipal,
+        tenant_id: &str,
+        filter: &ListFilter,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ListPage, ReadError> {
+        if !principal
+            .tenant_ids
+            .iter()
+            .any(|tenant| tenant == tenant_id)
+        {
+            return Err(ReadError::NotFound);
+        }
+        let limit = limit.clamp(1, MAX_LIST_LIMIT);
+        let rows = self
+            .index
+            .list(tenant_id, filter, limit + 1, cursor)
+            .await
+            .map_err(|err| ReadError::Backend(err.to_string()))?;
+
+        let mut artifacts = Vec::with_capacity(rows.len());
+        for row in rows.iter().take(limit) {
+            if principal.has_scope(row.kind)
+                && principal.max_sensitivity >= row.sensitivity
+                && row.state == crate::domain::ArtifactState::Stored
+                && row.retention_until > Utc::now()
+            {
+                artifacts.push(row.clone());
+            }
+        }
+
+        let offset: usize = cursor.and_then(|raw| raw.parse().ok()).unwrap_or(0);
+        let next_cursor = (rows.len() > limit).then(|| (offset + limit).to_string());
+        Ok(ListPage {
+            artifacts,
+            next_cursor,
+        })
     }
 
     /// 短签名：单对象、≤ 60s。

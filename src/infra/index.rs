@@ -31,6 +31,14 @@ impl std::fmt::Display for IndexError {
 
 impl std::error::Error for IndexError {}
 
+/// 列表筛选条件。**没有** `tenant_id`：租户永远来自调用方身份。
+#[derive(Debug, Clone, Default)]
+pub struct ListFilter {
+    pub kind: Option<Kind>,
+    pub subject_id: Option<String>,
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[async_trait]
 pub trait Index: Send + Sync {
     /// 按唯一键找当前行。`subject_id` 与 `dedupe_key` 都来自**服务端推导**，不取正文自述。
@@ -45,6 +53,15 @@ pub trait Index: Send + Sync {
     /// 按 id 读一行；**必须带租户**，否则跨租户会变成"能猜就能读"。
     async fn get(&self, tenant_id: &str, artifact_id: &str)
     -> Result<Option<Artifact>, IndexError>;
+
+    /// 时间倒序列表。`cursor` 是**不透明**字符串，P0 实现成十进制 offset。
+    async fn list(
+        &self,
+        tenant_id: &str,
+        filter: &ListFilter,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Vec<Artifact>, IndexError>;
 
     async fn insert(&self, artifact: &Artifact) -> Result<(), IndexError>;
 
@@ -133,6 +150,34 @@ impl Index for MemoryIndex {
         Ok(())
     }
 
+    async fn list(
+        &self,
+        tenant_id: &str,
+        filter: &ListFilter,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Vec<Artifact>, IndexError> {
+        let offset: usize = cursor.and_then(|raw| raw.parse().ok()).unwrap_or(0);
+        let mut matched: Vec<Artifact> = self
+            .rows
+            .read()
+            .expect("memory index poisoned")
+            .values()
+            .filter(|row| row.tenant_id == tenant_id)
+            .filter(|row| filter.kind.is_none_or(|kind| row.kind == kind))
+            .filter(|row| {
+                filter
+                    .subject_id
+                    .as_deref()
+                    .is_none_or(|subject| row.subject_id == subject)
+            })
+            .filter(|row| filter.since.is_none_or(|since| row.reported_at >= since))
+            .cloned()
+            .collect();
+        matched.sort_by_key(|row| std::cmp::Reverse(row.reported_at));
+        Ok(matched.into_iter().skip(offset).take(limit).collect())
+    }
+
     async fn update(&self, artifact: &Artifact) -> Result<(), IndexError> {
         let mut rows = self.rows.write().expect("memory index poisoned");
         match rows.get_mut(&artifact.artifact_id) {
@@ -166,7 +211,7 @@ mod pg {
         Artifact, ArtifactState, Durability, Kind, RetentionClass, Sensitivity, Verdict,
     };
 
-    use super::{Index, IndexError};
+    use super::{Index, IndexError, ListFilter};
 
     #[derive(Debug)]
     pub struct PgIndex {
@@ -309,6 +354,45 @@ mod pg {
             .await
             .map(|row| row.map(Artifact::from))
             .map_err(|err| IndexError::Backend(format!("get artifact: {err}")))
+        }
+
+        async fn list(
+            &self,
+            tenant_id: &str,
+            filter: &ListFilter,
+            limit: usize,
+            cursor: Option<&str>,
+        ) -> Result<Vec<Artifact>, IndexError> {
+            let offset: i64 = cursor
+                .and_then(|raw| raw.parse().ok())
+                .unwrap_or(0_i64)
+                .max(0);
+            // 一个静态语句盖住四种组合：`$n is null or …` 让可选筛选不需要拼 SQL
+            // （sqlx 0.9 不接受拼出来的字符串）。
+            let rows = sqlx::query_as::<_, Row>(
+                "select artifact_id, tenant_id, customer_id, kind, subtype, subject_type, \
+             subject_id, gateway_id, agent_id, command_id, dedupe_key, schema_id, sensitivity, \
+             retention_class, bucket, object_key, size_bytes, sha256, verdict, marker_ids, \
+             source_ref, source_sha256, durability, reported_at, stored_at, retention_until, \
+             legal_hold, state \
+             from evidence_artifact \
+             where tenant_id = $1 \
+               and ($2::text is null or kind = $2) \
+               and ($3::text is null or subject_id = $3) \
+               and ($4::timestamptz is null or reported_at >= $4) \
+             order by reported_at desc \
+             limit $5 offset $6",
+            )
+            .bind(tenant_id)
+            .bind(filter.kind.map(|kind| kind.as_str()))
+            .bind(filter.subject_id.as_deref())
+            .bind(filter.since)
+            .bind(limit as i64)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|err| IndexError::Backend(format!("list artifacts: {err}")))?;
+            Ok(rows.into_iter().map(Artifact::from).collect())
         }
 
         async fn insert(&self, artifact: &Artifact) -> Result<(), IndexError> {

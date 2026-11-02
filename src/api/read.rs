@@ -4,12 +4,14 @@
 //! **任何一条不满足都回 404**，不泄露"存在但不能看"。
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use crate::domain::Sensitivity;
+use crate::domain::{Kind, Sensitivity};
+use crate::infra::ListFilter;
 use crate::service::{PresignOutcome, ReadError, ReadPrincipal};
 
 use super::ReadState;
@@ -27,6 +29,80 @@ pub async fn metadata(
         Ok(artifact) => Json(artifact).into_response(),
         Err(error) => read_error_response(error),
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ListQuery {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub subject_id: Option<String>,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// 可选：显式指定租户；缺省用调用方身份里的第一个。必须落在身份集合内。
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+/// `GET /internal/evidence`：按时间倒序列出调用方可见的元数据。
+pub async fn list_evidence(
+    State(state): State<ReadState>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    let principal = match principal_from_headers(&headers) {
+        Some(principal) => principal,
+        None => return unauthorized(),
+    };
+    let Some(fallback_tenant) = principal.tenant_ids.first().cloned() else {
+        return unauthorized();
+    };
+    let kind = match query.kind.as_deref().filter(|raw| !raw.is_empty()) {
+        Some(raw) => match Kind::parse(raw) {
+            Some(kind) => Some(kind),
+            None => return bad_request("evidence_kind_unknown", "unknown kind"),
+        },
+        None => None,
+    };
+    let since = query
+        .since
+        .as_deref()
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|value| value.with_timezone(&Utc));
+    let filter = ListFilter {
+        kind,
+        subject_id: query.subject_id.filter(|value| !value.is_empty()),
+        since,
+    };
+    let tenant = query.tenant.unwrap_or(fallback_tenant);
+    match state
+        .service
+        .list(
+            &principal,
+            &tenant,
+            &filter,
+            query.limit.unwrap_or(50),
+            query.cursor.as_deref(),
+        )
+        .await
+    {
+        Ok(page) => Json(page).into_response(),
+        Err(error) => read_error_response(error),
+    }
+}
+
+fn bad_request(code: &str, message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": { "code": code, "message": message }
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Default, Deserialize)]

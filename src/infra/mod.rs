@@ -1,7 +1,7 @@
 pub mod index;
 pub mod object_store;
 
-pub use index::{Index, IndexError, MemoryIndex};
+pub use index::{Index, IndexError, ListFilter, MemoryIndex};
 pub use object_store::{MemoryObjectStore, ObjectMeta, ObjectStore, StoreError};
 
 #[cfg(feature = "pg")]
