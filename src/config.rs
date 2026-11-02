@@ -265,15 +265,17 @@ impl RawConfig {
         }
 
         let mut tokens = TokenMap::new();
-        for (token, raw) in self.sink.tokens {
+        for (raw_token, raw) in self.sink.tokens {
+            // 站点 token 本身就是**键**：允许多写一个 `${SEC_...}`，避免把 bearer 值写进配置文件。
+            let token = expand(env, &raw_token)?;
             if token.trim().is_empty() {
                 bail!("sink.tokens has an empty token");
             }
             if !crate::domain::artifact::is_safe_segment(raw.tenant_id.trim()) {
-                bail!("sink.tokens.{token}.tenant_id must be a safe key segment");
+                bail!("sink.tokens.<token>.tenant_id must be a safe key segment");
             }
             if raw.customer_id.trim().is_empty() {
-                bail!("sink.tokens.{token}.customer_id must not be empty");
+                bail!("sink.tokens.<token>.customer_id must not be empty");
             }
             tokens.insert(
                 token,
@@ -368,6 +370,25 @@ mod tests {
     fn parse(raw: &str) -> anyhow::Result<Config> {
         let raw: RawConfig = toml::from_str(raw)?;
         raw.resolve(&EnvDict::new())
+    }
+
+    #[test]
+    fn token_key_can_come_from_the_environment() {
+        let mut env = EnvDict::new();
+        env.insert("SEC_EVIDENCE_SINK_TOKEN", ValueType::from("tok_secret"));
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [sink.tokens."${SEC_EVIDENCE_SINK_TOKEN}"]
+            tenant_id = "t-001"
+            customer_id = "c-001"
+            "#,
+        )
+        .expect("toml");
+        let config = raw
+            .resolve(&env)
+            .expect("token key should expand from the secret dict");
+        assert!(config.sink.tokens.contains_key("tok_secret"));
+        assert_eq!(config.sink.tokens.len(), 1);
     }
 
     #[test]

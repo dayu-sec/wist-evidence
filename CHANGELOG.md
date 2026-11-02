@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## 0.1.2 · 2026-11-02
+
+- `[sink.tokens]` 的**键**也支持 `${SEC_...}`：站点 token 不再需要以明文写进配置文件
+  （值仍是租户 / 客户声明）。展开后仍含占位符则启动失败（fail-closed）。
+
 ## 0.1.1 · 2026-11-02
 
 - 新增 `GET /internal/evidence` 列表接口：时间倒序，支持 `kind` / `subject_id` / `since` 筛选；
