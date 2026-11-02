@@ -5,7 +5,9 @@ on:
     branches:
       - "*"
   pull_request:
-    types: [opened, reopened]
+    # `synchronize` 是必须的：dependabot rebase 之后只会发这个事件，
+    # 漏了就会出现「PR 有更新但没有 CI」，然后靠人工判断能不能合。
+    types: [opened, reopened, synchronize]
     branches:
       - "*"
   workflow_dispatch:
