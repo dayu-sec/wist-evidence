@@ -2,3 +2,6 @@
 _gal/.report/
 .run*
 .wist/
+
+docker/amd64/
+docker/arm64/

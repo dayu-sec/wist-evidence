@@ -112,27 +112,31 @@ systemctl daemon-reload && systemctl enable --now wist-evidence
 
 ### 容器
 
-镜像**在镜像内构建**（多阶段，与 `wist-atlas` 同构）：
+镜像**不在里面编译**（与 `wist-gateway` 同构）：二进制由 release 流水线按平台**原生**编译，
+build context 是 `docker/`，按架构提供 `amd64/` `arm64/` 产物，镜像只负责打包：
 
 ```bash
-# 本机架构（开发）
-docker build -t wist-evidence:dev .
+# 在 Linux 开发机上准备二进制（macOS 编不了 linux-gnu 目标）
+cargo build --release --locked --target aarch64-unknown-linux-gnu
+mkdir -p docker/arm64 && cp target/aarch64-unknown-linux-gnu/release/wist-evidence docker/arm64/
+docker build -t wist-evidence:dev docker
+```
 
-# 多架构（CI 的 release 流水线自动做：linux/amd64 + linux/arm64）
-docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/dayu-sec/wist-evidence:dev .
+日常直接拉 CI 产物即可（多架构由 release 流水线发布到 ghcr）：
 
+```bash
 docker run --rm -p 8080:8080 -p 8443:8443 \
   -v /etc/wist-evidence:/etc/wist-evidence:ro \
   -e WIST_EVIDENCE_CONFIG=/etc/wist-evidence/wist-evidence.toml \
   -e WIST_EVIDENCE_SEC_FILE=/etc/wist-evidence/.wist/sec-value.yml \
-  wist-evidence:dev
+  ghcr.io/dayu-sec/wist-evidence:v0.1.5-alpha
 ```
 
 端口约定：`8080` = 写（明文，只在内网）/ `8443` = 读。读端点 P0 靠内网 TLS 终结层保护，
 服务自带的 mTLS 在 P1 接入（设计稿 §16 / §19-10）。
 
-镜像是 stack（`wist-console-stack`）的交付物，按固定 tag 拉取；镜像的 GLIBC 与健康检查
-debian + busybox 口径与 atlas / ingest 保持一致。
+镜像以 **10001:10001** 运行；挂进来的配置 0644 即可，`sec-value.yml` 0640 且属主/属组为 10001。
+运行时镜像里带**静态 busybox**（`busybox-static`，`/bin/busybox`）供编排做健康检查。
 
 ## 待真机验证（不要当成已完成）
 

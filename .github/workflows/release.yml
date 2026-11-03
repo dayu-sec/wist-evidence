@@ -8,18 +8,21 @@ permissions:
   contents: read
 
 jobs:
-  build-matrix:
+  # 1. 按平台**原生**编译二进制，产出 tarball（直接下载 + 供 Docker 镜像用）。
+  #
+  #    不在镜像里编译：buildx 多架构会把 arm64 丢给 QEMU，sqlx / aws-sdk 能编到 40 分钟以上。
+  build-binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux 出**静态 musl**：制品会被抽出到宿主原生运行，不能绑宿主 glibc 版本。
+          # 容器镜像用 gnu 目标（镜像基础是 ubuntu:24.04，同一条 glibc 线）。
           - os: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
+            target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
+            target: aarch64-unknown-linux-gnu
           - os: macos-15
             target: aarch64-apple-darwin
     steps:
@@ -32,78 +35,29 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Install musl toolchain
-        if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
       - name: Cargo build
-        # ring / zstd 等 C 依赖按 target 取 CC；Rust 侧链接器指向 musl-gcc 才能真静态。
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          AR_x86_64_unknown_linux_musl: ar
-          CC_aarch64_unknown_linux_musl: musl-gcc
-          AR_aarch64_unknown_linux_musl: ar
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package artifacts
+      - name: Package tarball
         run: |
           set -euo pipefail
-          ARTIFACT="wist-evidence-${{ github.ref_name }}-${{ matrix.target }}"
-          BIN_DIR="target/${{ matrix.target }}/release"
-          test -x "${BIN_DIR}/wist-evidence" || { echo "拒绝打包：wist-evidence 缺失或不可执行" >&2; exit 1; }
-          mkdir -p "${ARTIFACT}"
-          cp -av "${BIN_DIR}/wist-evidence" "${ARTIFACT}/"
-          # 配置样例随包走：现场先有可跑的样例，再去换成 `${SEC_...}`。
-          cp -av wist-evidence.example.toml "${ARTIFACT}/"
-          tar -czf "${ARTIFACT}.tar.gz" "${ARTIFACT}"
-          LISTED="$(tar tzf "${ARTIFACT}.tar.gz")"
-          for f in wist-evidence wist-evidence.example.toml; do
-            case "${LISTED}" in
-              *"/${f}"*) echo "包内 ${f} ✓" ;;
-              *) echo "拒绝发布：${ARTIFACT}.tar.gz 里没有 ${f}" >&2; exit 1 ;;
-            esac
-          done
-          ls -lh "${ARTIFACT}.tar.gz"
+          mkdir -p artifacts
+          cp "target/${{ matrix.target }}/release/wist-evidence" artifacts/wist-evidence
+          cp wist-evidence.example.toml artifacts/wist-evidence.example.toml
+          tar -czf "wist-evidence-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" \
+            -C artifacts wist-evidence wist-evidence.example.toml
+          ls -lh "wist-evidence-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: wist-evidence-${{ github.ref_name }}-${{ matrix.target }}
+          name: wist-evidence-${{ matrix.target }}
           path: wist-evidence-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
           if-no-files-found: error
           retention-days: 7
 
-  release:
-    needs: [build-matrix]
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-          pattern: wist-evidence-*
-          merge-multiple: true
-
-      - name: Release
-        uses: softprops/action-gh-release@v3
-        with:
-          name: ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}
-          # alpha/beta 通道标为 prerelease（不占 latest）；stable 才是正式版。
-          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}
-          generate_release_notes: true
-          files: artifacts/*.tar.gz
-
-  # 容器镜像：stack（wist-console-stack）按固定 tag 拉，所以镜像必须与 tag 同源发布。
-  # 与 `wist-atlas` 同构：镜像内构建 + buildx 多架构。
-  image:
-    name: Build & push image
+  # 2. 用 Linux 二进制构建并推送多架构镜像（ghcr.io）。
+  docker:
+    needs: [build-binaries]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -112,14 +66,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wist-evidence-*-linux-gnu
+          path: staged
+          merge-multiple: true
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+      - name: Stage binaries for docker build
+        run: |
+          set -euo pipefail
+          mkdir -p docker/amd64 docker/arm64
+          tar -xzf "staged/wist-evidence-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz" -C docker/amd64
+          tar -xzf "staged/wist-evidence-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz" -C docker/arm64
+          ls -R docker/amd64 docker/arm64
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -128,7 +94,7 @@ jobs:
       - name: Compute image tags
         id: meta
         run: |
-          # 预发布 tag（v0.1.1-alpha 等）只推该 tag，不覆盖 :latest。
+          # 预发布 tag 只推该 tag，不覆盖 :latest（stack 按固定 tag 拉）。
           tags="ghcr.io/${{ github.repository }}:${{ github.ref_name }}"
           case "${{ github.ref_name }}" in
             *-*)
@@ -140,9 +106,34 @@ jobs:
           printf 'tags<<__EOF__\n%s\n__EOF__\n' "$tags" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@v6
         with:
-          context: .
+          context: docker
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           platforms: linux/amd64,linux/arm64
+
+  # 3. tarball 发到 GitHub Release。
+  release:
+    needs: [build-binaries]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wist-evidence-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}
+          generate_release_notes: true
+          files: artifacts/*.tar.gz

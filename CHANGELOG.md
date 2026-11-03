@@ -1,5 +1,19 @@
 # CHANGELOG
 
+## 0.1.5 · 2026-11-02
+
+- 镜像构建改用 `wist-gateway` 的同一套做法：release 流水线按平台**原生**编译二进制，
+  镜像只打包 `docker/amd64` / `docker/arm64`，不再在镜像内编译（QEMU 下编 sqlx / aws-sdk 极慢）。
+- 运行镜像改为 `ubuntu:24.04` + `busybox-static`（不再依赖 `busybox:stable` 的 glibc 版本），
+  uid 固定 10001。
+- GitHub Release 继续附带三个平台的原生二进制 tarball。
+
+## 0.1.4 · 2026-11-02
+
+- 修正运行时镜像：`busybox:stable` 现在要求 glibc 2.38，而 debian bookworm 只有 2.36，
+  容器内健康检查会直接报 `GLIBC_2.38 not found`；改用静态的 `busybox:stable-musl`。
+- 运行时阶段不装任何包（复制 CA），没有外网的环境也能构建镜像。
+
 ## 0.1.3 · 2026-11-02
 
 - 修正镜像构建：`gx adm v_patch` 只改 `Cargo.toml`，`Cargo.lock` 未同步，`--locked` 直接失败；
