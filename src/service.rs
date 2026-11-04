@@ -595,7 +595,20 @@ fn index_error(err: IndexError) -> WriteError {
 }
 
 fn store_error(err: StoreError) -> WriteError {
-    WriteError::Backend(err.to_string())
+    match err {
+        // 键不合法是服务端拼键的 bug：重试无用，按 400 回（不要把编程错误
+        // 伪装成临时故障，让 sink 反复重投到 rescue 里）。
+        StoreError::InvalidKey(message) => {
+            log::error!("evidence_object_key_invalid: {message}");
+            WriteError::BadRequest("evidence_object_key_invalid")
+        }
+        // 写路径目前没有实现会返回它；真出现也算能力/配置错，不当临时故障。
+        StoreError::Unsupported(action) => {
+            log::error!("evidence_write_unsupported: {action}");
+            WriteError::BadRequest("evidence_write_unsupported")
+        }
+        StoreError::Backend(message) => WriteError::Backend(message),
+    }
 }
 
 /// 配置里的 `[sink.tokens]`：`token = { tenant_id, customer_id }`。

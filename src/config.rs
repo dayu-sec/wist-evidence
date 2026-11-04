@@ -94,6 +94,7 @@ impl Config {
             toml::from_str(&raw).with_context(|| format!("parse config {}", path.display()))?;
         let env = secret_dict()?;
         raw.resolve(&env)
+            .with_context(|| format!("resolve config {}", path.display()))
     }
 }
 
@@ -329,8 +330,14 @@ impl RawConfig {
         let objects_kind = match self.objects.kind.trim() {
             "file" => ObjectsKind::File,
             "s3" => ObjectsKind::S3,
-            other => bail!("objects.kind must be file|s3, got {other:?}"),
+            other => bail!(
+                "objects.kind must be file|s3, got {other:?} \
+                 （from 0.1.7 the memory backend is gone）"
+            ),
         };
+        if self.objects.bucket.trim().is_empty() {
+            bail!("objects.bucket must not be empty");
+        }
         let dir = optional_expanded(env, &self.objects.dir)?;
         let endpoint = optional_expanded(env, &self.objects.endpoint)?;
         let region = optional_expanded(env, &self.objects.region)?;
@@ -460,6 +467,82 @@ mod tests {
         )
         .expect_err("s3 without keys must fail");
         assert!(error.to_string().contains("objects.access_key"));
+    }
+
+    #[test]
+    fn blank_objects_dir_is_rejected() {
+        let error = parse(
+            r#"
+            [sink.tokens.tok_dev]
+            tenant_id = "t-001"
+            customer_id = "c-001"
+            [objects]
+            kind = "file"
+            dir = "   "
+            "#,
+        )
+        .expect_err("blank dir must fail");
+        assert!(error.to_string().contains("requires objects.dir"));
+    }
+
+    #[test]
+    fn s3_objects_require_endpoint_and_region() {
+        let error = parse(
+            r#"
+            [sink.tokens.tok_dev]
+            tenant_id = "t-001"
+            customer_id = "c-001"
+            [objects]
+            kind = "s3"
+            access_key = "id"
+            secret_key = "key"
+            "#,
+        )
+        .expect_err("s3 without endpoint must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("objects.endpoint and objects.region")
+        );
+    }
+
+    #[test]
+    fn empty_bucket_is_rejected() {
+        for kind in ["file", "s3"] {
+            let error = parse(&format!(
+                r#"
+                [sink.tokens.tok_dev]
+                tenant_id = "t-001"
+                customer_id = "c-001"
+                [objects]
+                kind = "{kind}"
+                bucket = ""
+                endpoint = "https://cos.example.com"
+                region = "ap-shanghai"
+                access_key = "id"
+                secret_key = "key"
+                "#
+            ))
+            .expect_err("empty bucket must fail");
+            assert!(error.to_string().contains("objects.bucket"));
+        }
+    }
+
+    #[test]
+    fn objects_dir_is_kept_verbatim() {
+        // 库里的路径决定数据落点：配置层不做任何规范化（不补斜杠、不 trim）。
+        let config = parse(
+            r#"
+            [sink.tokens.tok_dev]
+            tenant_id = "t-001"
+            customer_id = "c-001"
+            [objects]
+            kind = "file"
+            dir = "./data/objects"
+            "#,
+        )
+        .expect("relative dir is allowed");
+        assert_eq!(config.objects.dir.as_deref(), Some("./data/objects"));
     }
 
     #[test]

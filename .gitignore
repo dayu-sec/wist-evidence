@@ -5,3 +5,6 @@ _gal/.report/
 
 docker/amd64/
 docker/arm64/
+
+# objects.kind = file 的默认落点（相对 crate 根运行示例配置时会生成）
+/data/

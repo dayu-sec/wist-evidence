@@ -21,12 +21,20 @@ ExecStart=/usr/local/bin/wist-evidence
 Restart=on-failure
 RestartSec=3
 
+# 证据正文的落点（`objects.kind = file`）：systemd 会建好 /var/lib/wist-evidence 并授权给 wisteve。
+# 配置里请写 `[objects] kind = "file"` + `dir = "/var/lib/wist-evidence/objects"`；
+# 切 COS（`kind = "s3"`）后本机不再写盘，这两行保留也无害。
+StateDirectory=wist-evidence
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/wist-evidence
+
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-# 只有配置目录可读；写入点都在 PG / COS，不在本机。
 ReadOnlyPaths=/etc/wist-evidence
+# 对象目录是唯一需要写的地方（StateDirectory 已包含在可写集合里）。
+ReadWritePaths=/var/lib/wist-evidence
 
 [Install]
 WantedBy=multi-user.target

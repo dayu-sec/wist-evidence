@@ -14,7 +14,9 @@ use tower::ServiceExt;
 
 use wist_evidence::api::{self, ReadState, SinkState};
 use wist_evidence::domain::Kind;
-use wist_evidence::infra::{MemoryIndex, MemoryObjectStore};
+use wist_evidence::infra::{
+    FileObjectStore, MemoryIndex, MemoryObjectStore, ObjectMeta, ObjectStore, StoreError,
+};
 use wist_evidence::service::{EvidenceService, SinkCaller, TokenMap};
 
 const TOKEN: &str = "tok_dev";
@@ -23,12 +25,68 @@ struct Harness {
     sink: Router,
     read: Router,
     index: Arc<MemoryIndex>,
-    objects: Arc<MemoryObjectStore>,
+    /// 断言用的具体后端：`None` 表示不是内存后端（file 直接看磁盘）。
+    memory: Option<Arc<MemoryObjectStore>>,
+    file: Option<Arc<FileObjectStore>>,
 }
 
-fn harness() -> Harness {
-    let index = Arc::new(MemoryIndex::new());
-    let objects = Arc::new(MemoryObjectStore::new());
+impl Harness {
+    /// 已写入的对象数（两种后端同一口径：一个对象 + 一个 sidecar 只算一个）。
+    fn object_count(&self) -> usize {
+        match (&self.memory, &self.file) {
+            (Some(memory), _) => memory.len(),
+            (None, Some(file)) => walk_objects(file.root()),
+            (None, None) => 0,
+        }
+    }
+
+    fn object_meta(&self, key: &str) -> Option<ObjectMeta> {
+        match (&self.memory, &self.file) {
+            (Some(memory), _) => memory.meta_of(key),
+            (None, Some(file)) => {
+                let text =
+                    std::fs::read_to_string(file.root().join(format!("{key}.meta.json"))).ok()?;
+                let parsed: std::collections::BTreeMap<String, String> =
+                    serde_json::from_str(&text).ok()?;
+                Some(parsed.into_iter().collect())
+            }
+            (None, None) => None,
+        }
+    }
+
+    /// 磁盘上的对象正文（仅 file 后端），已解压。
+    fn object_body(&self, key: &str) -> Option<Vec<u8>> {
+        let file = self.file.as_ref()?;
+        let compressed = std::fs::read(file.root().join(key)).ok()?;
+        zstd::decode_all(compressed.as_slice()).ok()
+    }
+}
+
+fn walk_objects(root: &std::path::Path) -> usize {
+    let mut count = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if !path.to_string_lossy().ends_with(".meta.json") {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn harness_with(
+    index: Arc<MemoryIndex>,
+    objects: Arc<dyn ObjectStore>,
+    memory: Option<Arc<MemoryObjectStore>>,
+    file: Option<Arc<FileObjectStore>>,
+) -> Harness {
     let service = Arc::new(EvidenceService::new(
         index.clone(),
         objects.clone(),
@@ -63,8 +121,25 @@ fn harness() -> Harness {
         ),
         read: api::read_router(ReadState { service }),
         index,
-        objects,
+        memory,
+        file,
     }
+}
+
+fn harness() -> Harness {
+    let memory = Arc::new(MemoryObjectStore::new());
+    harness_with(
+        Arc::new(MemoryIndex::new()),
+        memory.clone(),
+        Some(memory),
+        None,
+    )
+}
+
+/// 默认部署形态（`objects.kind = file`）的端到端 harness。
+fn file_harness(root: &std::path::Path) -> Harness {
+    let file = Arc::new(FileObjectStore::open(root).expect("open file store"));
+    harness_with(Arc::new(MemoryIndex::new()), file.clone(), None, Some(file))
 }
 
 fn report(command_id: &str, overall: &str) -> String {
@@ -180,7 +255,7 @@ async fn replaying_the_same_record_is_idempotent() {
     assert_eq!(second["artifacts"][0]["duplicate"], true);
 
     assert_eq!(h.index.len(), 1, "one dedupe key = one row");
-    assert_eq!(h.objects.len(), 1, "replay must not write a second object");
+    assert_eq!(h.object_count(), 1, "replay must not write a second object");
 }
 
 #[tokio::test]
@@ -211,7 +286,7 @@ async fn unsafe_subject_is_rejected() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "agent={agent:?} -> {body}");
     }
     assert!(
-        h.objects.is_empty(),
+        h.object_count() == 0,
         "rejected writes must not reach the object store"
     );
 }
@@ -277,7 +352,7 @@ async fn same_command_with_new_body_supersedes_the_row() {
 
     assert_eq!(h.index.len(), 1, "one dedupe key = one row");
     assert_eq!(
-        h.objects.len(),
+        h.object_count(),
         2,
         "old object is kept for cleanup, not overwritten"
     );
@@ -289,7 +364,7 @@ async fn object_metadata_carries_the_rebuild_fields() {
     post_record(&h.sink, TOKEN, sink_record("cmd-8", "ok")).await;
 
     let artifact = h.index.all().into_iter().next().unwrap();
-    let meta = h.objects.meta_of(&artifact.object_key).unwrap();
+    let meta = h.object_meta(&artifact.object_key).unwrap();
     for field in [
         "tenant-id",
         "kind",
@@ -384,4 +459,202 @@ async fn missing_token_is_401() {
         .unwrap();
     let response = h.sink.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── objects.kind = file：默认部署形态的端到端契约 ─────────────────────────────
+//
+// 上面那些用例跑在内存后端上（它只为测试存在）。现场与测试栈用的是 file 后端，
+// 所以「写下去的东西能不能在磁盘上被读回来」必须单独验一遍。
+
+struct TempDirGuard(std::path::PathBuf);
+
+impl TempDirGuard {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "wist-evidence-contract-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        Self(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[tokio::test]
+async fn file_backend_stores_body_and_metadata_on_disk() {
+    let dir = TempDirGuard::new("write");
+    let h = file_harness(dir.path());
+
+    let (status, body) = post_record(&h.sink, TOKEN, sink_record("cmd-file-1", "warn")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(h.object_count(), 1);
+
+    let artifact = h.index.all().into_iter().next().unwrap();
+    // 正文落盘、能解压回原文 —— 这是「本地文件可核对」的全部意义。
+    let stored = h.object_body(&artifact.object_key).expect("object on disk");
+    assert_eq!(
+        String::from_utf8(stored).unwrap(),
+        report("cmd-file-1", "warn")
+    );
+
+    // 七个自描述字段都在 sidecar 里，且与索引行一致（索引可从对象重建）。
+    let meta = h.object_meta(&artifact.object_key).expect("sidecar");
+    let fields: Vec<&str> = meta.iter().map(|(name, _)| name.as_str()).collect();
+    for expected in [
+        "tenant-id",
+        "kind",
+        "subject-id",
+        "schema-id",
+        "sensitivity",
+        "sha256",
+        "command-id",
+    ] {
+        assert!(
+            fields.contains(&expected),
+            "missing {expected} in {fields:?}"
+        );
+    }
+    let sha256 = meta
+        .iter()
+        .find(|(name, _)| name == "sha256")
+        .map(|(_, value)| value.clone())
+        .unwrap();
+    assert_eq!(sha256, artifact.sha256);
+}
+
+#[tokio::test]
+async fn file_backend_replay_writes_one_object() {
+    let dir = TempDirGuard::new("replay");
+    let h = file_harness(dir.path());
+    let record = sink_record("cmd-file-2", "ok");
+
+    let (_, first) = post_record(&h.sink, TOKEN, record.clone()).await;
+    let (status, second) = post_record(&h.sink, TOKEN, record).await;
+
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["duplicates"], 1);
+    assert_eq!(
+        second["artifacts"][0]["artifact_id"], first["artifacts"][0]["artifact_id"],
+        "same dedupe key must reuse the artifact"
+    );
+    assert_eq!(h.object_count(), 1, "replay must not write a second file");
+}
+
+#[tokio::test]
+async fn file_backend_supersede_keeps_the_old_object() {
+    let dir = TempDirGuard::new("supersede");
+    let h = file_harness(dir.path());
+
+    post_record(&h.sink, TOKEN, sink_record("cmd-file-3", "warn")).await;
+    let (status, _) = post_record(&h.sink, TOKEN, sink_record("cmd-file-3", "fail")).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(h.index.len(), 1, "one dedupe key = one row");
+    assert_eq!(h.object_count(), 2, "键不可覆盖：旧对象的文件要留着待清");
+}
+
+#[tokio::test]
+async fn file_backend_presign_returns_501() {
+    let dir = TempDirGuard::new("presign");
+    let h = file_harness(dir.path());
+    let (_, body) = post_record(&h.sink, TOKEN, sink_record("cmd-file-4", "ok")).await;
+    let artifact_id = body["artifacts"][0]["artifact_id"].as_str().unwrap();
+
+    let (status, payload) = presign(&h.read, artifact_id, 60).await;
+
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{payload}");
+    assert_eq!(payload["error"]["code"], "evidence_presign_unsupported");
+    let message = payload["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("objects.kind = s3"), "{message}");
+    // 501 不能长得像一次成功的签发。
+    assert!(payload.get("expires_in_seconds").is_none(), "{payload}");
+    // 也不能把宿主路径漏出去。
+    assert!(
+        !message.contains(dir.path().to_string_lossy().as_ref()),
+        "message leaks objects.dir: {message}"
+    );
+}
+
+#[tokio::test]
+async fn file_backend_presign_of_a_missing_artifact_is_404_not_501() {
+    let dir = TempDirGuard::new("presign-missing");
+    let h = file_harness(dir.path());
+
+    let (status, payload) = presign(&h.read, "art_does_not_exist", 60).await;
+
+    // 可见性判断在前：不存在 / 无权看 一律 404，不能被 501 抢答。
+    assert_eq!(status, StatusCode::NOT_FOUND, "{payload}");
+    assert_eq!(payload["error"]["code"], "evidence_not_found");
+}
+
+// ── 存储故障 / 非法键的错误分级 ──────────────────────────────────────────────
+
+/// 恒失败的后端：用来验「先对象后索引」与错误码分级。
+struct FailingStore {
+    error: fn() -> StoreError,
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FailingStore {
+    async fn put(&self, _key: &str, _bytes: Vec<u8>, _meta: &ObjectMeta) -> Result<(), StoreError> {
+        Err((self.error)())
+    }
+
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        Err((self.error)())
+    }
+
+    async fn presign_get(
+        &self,
+        _key: &str,
+        _ttl: std::time::Duration,
+    ) -> Result<String, StoreError> {
+        Err((self.error)())
+    }
+}
+
+fn failing_harness(error: fn() -> StoreError) -> Harness {
+    harness_with(
+        Arc::new(MemoryIndex::new()),
+        Arc::new(FailingStore { error }),
+        None,
+        None,
+    )
+}
+
+#[tokio::test]
+async fn backend_failure_is_502_and_leaves_no_index_row() {
+    let h = failing_harness(|| StoreError::Backend("disk full".to_string()));
+
+    let (status, body) = post_record(&h.sink, TOKEN, sink_record("cmd-fail-1", "ok")).await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"]["code"], "evidence_write_failed");
+    // D6：先对象、后索引 —— 对象失败不能留下行。
+    assert_eq!(h.index.len(), 0, "no row may survive a failed object write");
+}
+
+#[tokio::test]
+async fn invalid_object_key_is_400_not_502() {
+    let h = failing_harness(|| StoreError::InvalidKey("unsafe key".to_string()));
+
+    let (status, body) = post_record(&h.sink, TOKEN, sink_record("cmd-fail-2", "ok")).await;
+
+    // 拼键错误是编程错误：重试不会变好，不能伪装成 5xx 让 sink 反复重投。
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "evidence_object_key_invalid");
+    assert_eq!(h.index.len(), 0);
 }

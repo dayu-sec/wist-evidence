@@ -1,5 +1,38 @@
 # CHANGELOG
 
+## 0.1.8 · 2026-11-04
+
+本轮是对象存储的「写完再读一遍」：6 轮独立评审后的修正 + 补齐测试（31 → 57 个）。
+
+修正（均为本地文件后端的行为）：
+
+- `FileObjectStore::open` 真正做到启动即失败：空 `dir`、路径是普通文件、目录不可写都在启动时报错
+  （之前 `create_dir_all` 对已存在目录只做 stat，只读挂载要到第一次写入才 502）。
+  `root` 统一 canonicalize，启动日志里的落点变绝对路径。
+- 临时文件改成**每次写唯一**（`.<name>.partial-<pid>-<nanos>`）。旧实现用
+  `with_extension("partial")`，同键并发写会踩同一个临时文件。
+- 正文与 `.meta.json` 都走「tmp + `sync_all` + rename」，失败不留半截文件，
+  也不再出现「sidecar 截断」这种静默损坏。
+- 根目录消失（卷卸载 / 误删）不再答成 `Ok(None)`：那是存储故障，不是「对象不存在」；
+  也不会在容器层悄悄重建一个重启即丢的目录。
+- 新增 `StoreError::InvalidKey`：非法键（`..`、绝对路径、空段）不再伪装成后端故障。
+  写路径回 `400 evidence_object_key_invalid`（不重试），读路径回后端错误。
+- 配置：`objects.bucket` 必须非空；`resolve` 出错带上配置路径；
+  `objects.kind = memory` 的报错补一句「0.1.7 起已取消」。
+- systemd unit 补 `StateDirectory` / `WorkingDirectory` / `ReadWritePaths`：
+  裸机按默认 `file` 模式跑时不会再因只读根目录起不来。
+
+测试（新增 26 个）：
+
+- 文件后端：二进制正文回读、空正文 vs 不存在、sidecar 逐字段、同键覆盖、
+  重启（drop 后重开）仍可读、无 `.partial` 残留、6 种非法键、目录/根目录消失、
+  并发写不同键与同键不撕裂。
+- 契约（file 后端首次有端到端覆盖）：正文落盘能解压回原文、七字段与索引行一致、
+  重投不写第二个对象、supersede 保留旧对象、`:presign` 回 501 且不泄露路径、
+  不存在的 artifact 仍是 404；另用恒失败的后端验「对象失败不留索引行」与
+  「非法键 400 / 后端故障 502」的分级。
+- 配置：空白 `dir`、s3 缺 endpoint/region、空 `bucket`、相对 `dir` 原样保留。
+
 ## 0.1.7 · 2026-11-04
 
 - 对象存储改成**两种模式**，去掉可部署的「内存」档（正文丢了就再也要不回来）：
