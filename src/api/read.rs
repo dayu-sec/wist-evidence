@@ -5,7 +5,7 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -145,6 +145,35 @@ pub async fn presign_at(
         .await
     {
         Ok(outcome) => Json::<PresignOutcome>(outcome).into_response(),
+        Err(error) => read_error_response(error),
+    }
+}
+
+/// `GET /internal/evidence/{artifact_id}/content`——代理读正文（§7.2）。
+///
+/// 可见性判断与元数据读一致；正文在对象层是 zstd 压缩的，这里解压后回原文。
+/// 本地文件模式（`objects.kind = file`）没有签名 URL，就靠这条读正文。
+pub async fn content(
+    State(state): State<ReadState>,
+    headers: HeaderMap,
+    Path(artifact_id): Path<String>,
+) -> Response {
+    let principal = match principal_from_headers(&headers) {
+        Some(principal) => principal,
+        None => return unauthorized(),
+    };
+    match state.service.read_content(&principal, &artifact_id).await {
+        Ok((_artifact, body)) => (
+            [
+                (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+                // 证据正文不进任何缓存（浏览器 / 中间代理）。
+                (header::CACHE_CONTROL, "no-store"),
+                // 正文是文件，不是页面：避免被当成 HTML 渲染。
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            body,
+        )
+            .into_response(),
         Err(error) => read_error_response(error),
     }
 }

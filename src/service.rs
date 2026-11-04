@@ -411,6 +411,43 @@ impl EvidenceService {
         })
     }
 
+    /// 代理读正文：不经签名 URL，直接把原文（已解压）交给调用方。
+    ///
+    /// 这是 `objects.kind = file` 下**唯一**的读正文通路（本地目录没有预签名）；
+    /// `s3` 模式下用作“证据桶不可达”时的兼任路径（§7.1）。
+    /// 可见性判断与元数据读完全一致：任何一条不满足都是 404。
+    pub async fn read_content(
+        &self,
+        principal: &ReadPrincipal,
+        artifact_id: &str,
+    ) -> Result<(Artifact, Vec<u8>), ReadError> {
+        let artifact = self.find_visible(principal, artifact_id).await?;
+        let stored = self
+            .objects
+            .get(&artifact.object_key)
+            .await
+            .map_err(|err| ReadError::Backend(err.to_string()))?
+            .ok_or_else(|| {
+                // 索引说有、对象没了：这是存储故障/待对账，不能答 404。
+                ReadError::Backend(format!(
+                    "object {} for artifact {} is missing",
+                    artifact.object_key, artifact.artifact_id
+                ))
+            })?;
+        let body = zstd::decode_all(stored.as_slice()).map_err(|err| {
+            ReadError::Backend(format!("decompress {}: {err}", artifact.object_key))
+        })?;
+        // P0 的审计就是这一行（与 presign 同一口径）。
+        log::info!(
+            "evidence_content tenant={} artifact={} kind={} bytes={}",
+            artifact.tenant_id,
+            artifact.artifact_id,
+            artifact.kind.as_str(),
+            body.len()
+        );
+        Ok((artifact, body))
+    }
+
     /// 短签名：单对象、≤ 60s。
     pub async fn presign(
         &self,

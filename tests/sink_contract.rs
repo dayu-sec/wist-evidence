@@ -715,3 +715,103 @@ async fn read_backend_failure_is_502_without_leaking_details() {
         "read response leaks errno detail: {rendered}"
     );
 }
+
+// ── 代理读正文：`GET /internal/evidence/{id}/content`（§7.2）────────────────
+
+async fn get_content(
+    read: &Router,
+    tenant: &str,
+    artifact_id: &str,
+) -> (StatusCode, String, Vec<u8>) {
+    let request = Request::builder()
+        .uri(format!("/internal/evidence/{artifact_id}/content"))
+        .header("x-evidence-tenant", tenant)
+        .header("x-evidence-scopes", "evidence:read")
+        .header("x-evidence-max-sensitivity", "commandlines")
+        .body(Body::empty())
+        .unwrap();
+    let response = read.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, content_type, bytes)
+}
+
+#[tokio::test]
+async fn content_returns_the_original_body() {
+    let dir = TempDirGuard::new("content");
+    let h = file_harness(dir.path());
+    let (_, body) = post_record(&h.sink, TOKEN, sink_record("cmd-content-1", "warn")).await;
+    let artifact_id = body["artifacts"][0]["artifact_id"].as_str().unwrap();
+
+    let (status, content_type, bytes) = get_content(&h.read, "t-001", artifact_id).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}"
+    );
+    // 对象层是 zstd 压缩的；代理读要回**原文**，否则前端拿到的是二进制。
+    assert_eq!(
+        String::from_utf8(bytes).unwrap(),
+        report("cmd-content-1", "warn")
+    );
+}
+
+#[tokio::test]
+async fn content_respects_tenant_and_sensitivity() {
+    let dir = TempDirGuard::new("content-visibility");
+    let h = file_harness(dir.path());
+    let (_, body) = post_record(&h.sink, TOKEN, sink_record("cmd-content-2", "ok")).await;
+    let artifact_id = body["artifacts"][0]["artifact_id"].as_str().unwrap();
+
+    // 跨租户：404，不泄露「存在但不能看」。
+    let (status, _, bytes) = get_content(&h.read, "t-002", artifact_id).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    // 不存在：同样 404。
+    let (status, _, _) = get_content(&h.read, "t-001", "art_missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn content_of_a_vanished_object_is_502_not_404() {
+    let dir = TempDirGuard::new("content-vanished");
+    let h = file_harness(dir.path());
+    let (_, body) = post_record(&h.sink, TOKEN, sink_record("cmd-content-3", "ok")).await;
+    let artifact_id = body["artifacts"][0]["artifact_id"].as_str().unwrap();
+
+    // 索引说有、对象被删掉：这是存储故障/待对账，答 404 会让人以为证据从未存在。
+    let artifact = h.index.all().into_iter().next().unwrap();
+    std::fs::remove_file(dir.path().join(&artifact.object_key)).expect("remove object");
+
+    let (status, _, bytes) = get_content(&h.read, "t-001", artifact_id).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    // 5xx 不回显后端细节。
+    let rendered = String::from_utf8_lossy(&bytes);
+    assert!(
+        !rendered.contains(dir.path().to_string_lossy().as_ref()),
+        "{rendered}"
+    );
+}

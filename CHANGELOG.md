@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 0.1.10 · 2026-11-04
+
+- 新增 `GET /internal/evidence/{artifact_id}/content`：**代理读正文**（设计稿 §7.2 预留的那条）。
+  可见性判断与元数据读一致（跨租户 / 低敏感度 / 已过期 → 404）；对象层是 zstd 压缩的，
+  服务解压后回原文（`application/json`、`cache-control: no-store`、`nosniff`）。
+  本地文件存储（`objects.kind = file`）没有预签名 URL，这是它**唯一**的读正文通路。
+- 索引里有、对象没了 → `502 evidence_read_failed`（不当成「证据不存在」），细节只进日志。
+- 每次代理读记一行 `evidence_content` 审计日志（与 `evidence_presign` 同口径）。
+- 补 3 个契约测试：原文回读、跨租户/不存在 404、对象消失 502。
+
 ## 0.1.9 · 2026-11-04
 
 - 5xx 响应体不再回显后端原文：`evidence_write_failed` / `evidence_read_failed` 现在只回一句

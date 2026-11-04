@@ -51,6 +51,11 @@ pub fn read_router(state: ReadState) -> Router {
             "/internal/evidence/{artifact_id}",
             get(read::metadata).post(read::presign_at),
         )
+        // 代理读正文（§7.2）：本地文件模式没有签名 URL，这是唯一的读正文通路。
+        .route(
+            "/internal/evidence/{artifact_id}/content",
+            get(read::content),
+        )
         .with_state(state)
 }
 

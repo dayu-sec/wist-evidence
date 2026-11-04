@@ -16,6 +16,7 @@
 | 对象存储：**本地目录** / **S3（COS / MinIO）** | ✅ |
 | `GET /internal/evidence/{id}` 元数据读（跨租户/低敏感度 → 404） | ✅ |
 | `POST /internal/evidence/{id}:presign` 短签名（≤ 60s、单对象） | ✅（仅 `s3`） |
+| `GET /internal/evidence/{id}/content` 代理读正文 | ✅ |
 | PG 索引 / S3(COS) 对象 | ✅ 代码就绪（`pg` / `s3` feature），**未接真机** |
 | 清理作业、删除凭证、对账、索引重建、前缀级 STS、每客户 CMK | ⬜ P1+ |
 
