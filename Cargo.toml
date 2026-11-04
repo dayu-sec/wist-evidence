@@ -1,6 +1,6 @@
 [package]
 name = "wist-evidence"
-version = "0.1.5" #@gxl:set(version)
+version = "0.1.6" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 authors = ["wist Dev Team"]
@@ -16,6 +16,7 @@ s3 = ["dep:aws-sdk-s3"]
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }

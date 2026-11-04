@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 0.1.6 · 2026-11-02
+
+- 写端点新增 **Basic 认证**：`username` = 站点 token（`password` 留空）。
+  这是给 warp-parse http 连接器用的 —— 它只有 `username` / `password` 两个稳定字段，
+  不依赖 header 值的 `${VAR}` 展开；`Bearer` 继续支持。
+- 文档补齐写入契约：请求形状、字段缺省、幂等语义、错误码，以及可直接 copy 的 wparse
+  连接器 / sink 分组位置（见 `wist-console-stack/examples/warp-parse/`）。
+
 ## 0.1.5 · 2026-11-02
 
 - 镜像构建改用 `wist-gateway` 的同一套做法：release 流水线按平台**原生**编译二进制，

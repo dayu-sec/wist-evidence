@@ -56,12 +56,40 @@ fn authenticate(state: &SinkState, headers: &HeaderMap) -> Result<SinkCaller, Au
         return Err(AuthError::Missing);
     };
     let raw = raw.to_str().unwrap_or_default();
-    let token = raw
+    let token = credential(raw).filter(|token| !token.is_empty());
+    let Some(token) = token else {
+        return Err(AuthError::Invalid);
+    };
+    state.tokens.get(&token).cloned().ok_or(AuthError::Invalid)
+}
+
+/// 两种凭据形状：
+/// - `Bearer <token>`：网关 / 脚本直接用这个；
+/// - `Basic base64(<token>:)`：给 **warp-parse 的 http 连接器**用 —— 它只有
+///   `username` / `password` 两个字段，自定义 header 的 env 展开没验证过，
+///   而 `username` 走环境变量是确定可用的。此时 `username` 就是站点 token。
+fn credential(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if let Some(token) = raw
         .strip_prefix("Bearer ")
         .or_else(|| raw.strip_prefix("bearer "))
-        .unwrap_or(raw)
-        .trim();
-    state.tokens.get(token).cloned().ok_or(AuthError::Invalid)
+    {
+        return Some(token.trim().to_string());
+    }
+    if let Some(encoded) = raw
+        .strip_prefix("Basic ")
+        .or_else(|| raw.strip_prefix("basic "))
+    {
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded.trim())
+            .ok()?;
+        let text = String::from_utf8(decoded).ok()?;
+        let (user, _password) = text.split_once(':')?;
+        return Some(user.to_string());
+    }
+    // 兼容直接贴 token 的裸写（不推荐，但不要让一个好心的调用方默默失败）。
+    Some(raw.to_string())
 }
 
 /// 小枚举而不是 `Response`：后者会把 `Result` 撑到 128 字节（clippy::result_large_err）。

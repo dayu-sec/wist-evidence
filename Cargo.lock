@@ -3641,12 +3641,13 @@ dependencies = [
 
 [[package]]
 name = "wist-evidence"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
  "aws-sdk-s3",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "env_logger",
  "hex",

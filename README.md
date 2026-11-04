@@ -27,11 +27,22 @@
 
 > 写端点**不能**和读端点共用端口：混在一起就得让写路径容忍"没有证书"的流量。
 
-## 写入语义（给数据面配置的人看）
+## 写入接口（数据面 / 脚本）
 
-`agentd --IVSREP--> 网关数据面 --> 平台数据面（wparse） --http_sink--> wist-evidence`
+```text
+POST /internal/evidence
+Authorization: Bearer <站点 token>        # 或 Basic base64(<站点 token>:)
+Content-Type: application/json
+```
 
-请求体是 wparse 的记录（单对象或数组）：
+- **监听**：`[sink].listen_addr`（默认 `0.0.0.0:8080`，明文，只在内网）；
+- **认证**：
+  - `Bearer <token>`：网关 / 脚本；
+  - `Basic base64(<token>:)`：**warp-parse 的 http 连接器**用这个 —— `username` = token、
+    `password` 留空（连接器只有 username/password 两个稳定字段，不依赖 header 里的 `${VAR}` 展开）；
+  - token 来自 `[sink.tokens]` 的**键**（可用 `${SEC_...}` 引用密钥文件）。
+
+请求体是 wparse 的记录（**单对象或数组**）：
 
 ```json
 {
@@ -44,10 +55,18 @@
 }
 ```
 
-- `body` 是契约对象的 **JSON 字符串**（与网关 `api/ingest.rs` 同一条纪律）；
-- `kind` 由 `schema` 帧标记推导（只认 `IVSREP`），`subject_id` 取信封 `agent`；
-- **同键同 `sha256` = 重投** → `200` + 同一个 `artifact_id`，不写第二个对象；
-- 只有"真的没存下"才回 5xx —— 那会让 sink 重试并最终把失败落成可见的 rescue 文件。
+| 字段 | 必填 | 缺省 / 说明 |
+|---|---|---|
+| `schema` | ✅ | 只认 `IVSREP`（→ `kind=investigation_report`）；其它帧标记 `400` |
+| `agent` | ✅ | 信封里的主体；也是对象键的 `subject_id`（`../`、`/` 等非法段直接 `400`） |
+| `body` | ✅ | 契约对象的 **JSON 字符串**（与网关 `api/ingest.rs` 同一条纪律） |
+| `sensitivity` | — | 缺省 `paths`（调查报告 30 天） |
+| `durability` | — | 缺省 `best_effort` |
+| `ts` | — | 缺省 = 服务端收到的时间 |
+| `sha256` | — | 写入方自报；与计算结果不符 → `422` |
+
+**幂等**：同 `(tenant, kind, subject, command_id)` 且 `sha256` 相同 → `200` + 同一个
+`artifact_id`，不写第二个对象；同键不同正文 → 新对象 + 行内切换（旧对象保留待清）。
 
 响应：
 
@@ -55,6 +74,22 @@
 { "count": 1, "duplicates": 0,
   "artifacts": [{ "artifact_id": "art_...", "durability": "best_effort", "duplicate": false, "superseded": false }] }
 ```
+
+### 错误码
+
+| 状态 | code | 含义 |
+|---|---|---|
+| 400 | `evidence_frame_not_evidence` / `evidence_subject_invalid` / `evidence_body_invalid` / `evidence_schema_missing` | 参数不对，重试无用 |
+| 401 | `evidence_token_missing` / `evidence_token_invalid` | 认证失败 |
+| 403 | `evidence_kind_not_allowed` / `evidence_tenant_mismatch` | 部署未开该 kind / 正文自述租户与身份不符 |
+| 413 | `evidence_body_too_large` | 超过 `[sink].max_body_bytes` |
+| 422 | `evidence_integrity_failed` | 自报 sha256 与内容不符 |
+| 5xx | `evidence_write_failed` | **只有这类才该重试**（sink 会重试后落 rescue 文件） |
+
+### 可直接 copy 的 wparse 配置
+
+见 [`wist-console-stack/examples/warp-parse/`](https://github.com/dayu-sec/wist-console-stack/tree/main/examples/warp-parse)：
+一个连接器 + 一个 sink 分组，配合 `EVIDENCE_SINK_URL` / `EVIDENCE_SINK_TOKEN` 两个环境变量。
 
 ## 构建
 

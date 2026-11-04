@@ -342,6 +342,38 @@ async fn list_hides_artifacts_above_the_caller_sensitivity() {
 }
 
 #[tokio::test]
+async fn basic_auth_username_is_the_site_token() {
+    // wparse 的 http 连接器只有 `username` / `password`：Basic 的 username 就是站点 token。
+    let h = harness();
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode("tok_dev:");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/internal/evidence")
+        .header("authorization", format!("Basic {encoded}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&sink_record("cmd-basic-1", "ok")).unwrap(),
+        ))
+        .unwrap();
+    let response = h.sink.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let wrong = base64::engine::general_purpose::STANDARD.encode("tok_nope:");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/internal/evidence")
+        .header("authorization", format!("Basic {wrong}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&sink_record("cmd-basic-2", "ok")).unwrap(),
+        ))
+        .unwrap();
+    let response = h.sink.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn missing_token_is_401() {
     let h = harness();
     let request = Request::builder()
