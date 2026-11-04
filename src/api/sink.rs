@@ -158,7 +158,16 @@ impl WriteErrorResponse for WriteError {
                 "sha256 mismatch".to_string(),
             ),
             // 5xx 是**故意**的：让 sink 重试并最终把失败落成可见的 rescue 文件。
-            Self::Backend(message) => (StatusCode::BAD_GATEWAY, "evidence_write_failed", message),
+            // 但**细节只进日志**：后端原文里有宿主绝对路径 / errno / 桶名，
+            // 不能回给数据面，否则就是一个免费的目录与磁盘状态探测器。
+            Self::Backend(detail) => {
+                log::error!("evidence_write_failed: {detail}");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "evidence_write_failed",
+                    "internal error while storing the artifact".to_string(),
+                )
+            }
         };
         error_response(status, code, message)
     }

@@ -643,6 +643,12 @@ async fn backend_failure_is_502_and_leaves_no_index_row() {
 
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body["error"]["code"], "evidence_write_failed");
+    // 细节只进日志：后端原文（含宿主路径 / errno）不能回到数据面。
+    let rendered = body.to_string();
+    assert!(
+        !rendered.contains("disk full"),
+        "response leaks backend detail: {rendered}"
+    );
     // D6：先对象、后索引 —— 对象失败不能留下行。
     assert_eq!(h.index.len(), 0, "no row may survive a failed object write");
 }
@@ -657,4 +663,55 @@ async fn invalid_object_key_is_400_not_502() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["code"], "evidence_object_key_invalid");
     assert_eq!(h.index.len(), 0);
+}
+
+/// 写入正常、只有签名失败的后端：用来验读路径的 5xx 也不回显后端原文。
+struct PresignFailsStore;
+
+#[async_trait::async_trait]
+impl ObjectStore for PresignFailsStore {
+    async fn put(&self, _key: &str, _bytes: Vec<u8>, _meta: &ObjectMeta) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(None)
+    }
+
+    async fn presign_get(
+        &self,
+        _key: &str,
+        _ttl: std::time::Duration,
+    ) -> Result<String, StoreError> {
+        Err(StoreError::Backend(
+            "sign /var/lib/wist-evidence/objects/secret: permission denied".to_string(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn read_backend_failure_is_502_without_leaking_details() {
+    let h = harness_with(
+        Arc::new(MemoryIndex::new()),
+        Arc::new(PresignFailsStore),
+        None,
+        None,
+    );
+    let (status, body) = post_record(&h.sink, TOKEN, sink_record("cmd-leak-1", "ok")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let artifact_id = body["artifacts"][0]["artifact_id"].as_str().unwrap();
+
+    let (status, payload) = presign(&h.read, artifact_id, 60).await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{payload}");
+    assert_eq!(payload["error"]["code"], "evidence_read_failed");
+    let rendered = payload.to_string();
+    assert!(
+        !rendered.contains("/var/lib/wist-evidence"),
+        "read response leaks host path: {rendered}"
+    );
+    assert!(
+        !rendered.contains("permission denied"),
+        "read response leaks errno detail: {rendered}"
+    );
 }

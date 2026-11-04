@@ -203,13 +203,20 @@ fn read_error_response(error: ReadError) -> Response {
             })),
         )
             .into_response(),
-        ReadError::Backend(message) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": { "code": "evidence_read_failed", "message": message }
-            })),
-        )
-            .into_response(),
+        ReadError::Backend(detail) => {
+            // 细节只进日志：后端原文带宿主路径 / errno，回给调用方等于泄露目录结构。
+            log::error!("evidence_read_failed: {detail}");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "evidence_read_failed",
+                        "message": "internal error while reading the artifact"
+                    }
+                })),
+            )
+                .into_response()
+        }
         // `objects.kind = file`：本地目录没有可对外下发的签名 URL。
         ReadError::Unsupported(message) => (
             StatusCode::NOT_IMPLEMENTED,

@@ -80,12 +80,16 @@ Content-Type: application/json
 
 | 状态 | code | 含义 |
 |---|---|---|
-| 400 | `evidence_frame_not_evidence` / `evidence_subject_invalid` / `evidence_body_invalid` / `evidence_schema_missing` | 参数不对，重试无用 |
+| 400 | `evidence_frame_not_evidence` / `evidence_subject_invalid` / `evidence_body_invalid` / `evidence_schema_missing` / `evidence_object_key_invalid` | 参数不对，重试无用 |
 | 401 | `evidence_token_missing` / `evidence_token_invalid` | 认证失败 |
 | 403 | `evidence_kind_not_allowed` / `evidence_tenant_mismatch` | 部署未开该 kind / 正文自述租户与身份不符 |
 | 413 | `evidence_body_too_large` | 超过 `[sink].max_body_bytes` |
 | 422 | `evidence_integrity_failed` | 自报 sha256 与内容不符 |
 | 5xx | `evidence_write_failed` | **只有这类才该重试**（sink 会重试后落 rescue 文件） |
+
+> 5xx 的 `message` **只有一句通用文案**：后端原文（宿主绝对路径、errno、桶名）只进服务日志。
+> 数据面拿到 `evidence_write_failed` 就该重试，细节去看服务日志——不要把路径回给调用方，
+> 那等于送一个目录与磁盘状态探测器。
 
 ### 可直接 copy 的 wparse 配置
 
