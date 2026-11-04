@@ -13,8 +13,9 @@
 | `POST /internal/evidence` sink 写入（单对象 / 数组、幂等） | ✅ |
 | 索引写入（`(tenant, kind, subject, dedupe_key)` 唯一） | ✅ |
 | 对象写入（先对象后索引；7 个自描述元数据字段） | ✅ |
+| 对象存储：**本地目录** / **S3（COS / MinIO）** | ✅ |
 | `GET /internal/evidence/{id}` 元数据读（跨租户/低敏感度 → 404） | ✅ |
-| `POST /internal/evidence/{id}:presign` 短签名（≤ 60s、单对象） | ✅ |
+| `POST /internal/evidence/{id}:presign` 短签名（≤ 60s、单对象） | ✅（仅 `s3`） |
 | PG 索引 / S3(COS) 对象 | ✅ 代码就绪（`pg` / `s3` feature），**未接真机** |
 | 清理作业、删除凭证、对账、索引重建、前缀级 STS、每客户 CMK | ⬜ P1+ |
 
@@ -90,6 +91,35 @@ Content-Type: application/json
 
 见 [`wist-console-stack/examples/warp-parse/`](https://github.com/dayu-sec/wist-console-stack/tree/main/examples/warp-parse)：
 一个连接器 + 一个 sink 分组，配合 `EVIDENCE_SINK_URL` / `EVIDENCE_SINK_TOKEN` 两个环境变量。
+
+## 对象存储：两种模式
+
+正文只有两个落点，**没有「内存」这一档**（正文丢了就再也要不回来，不该成为部署选项）：
+
+| `objects.kind` | 用在哪 | 落点 | 预签名 |
+|---|---|---|---|
+| `file` | 测试 / 现场验证 | `<objects.dir>/<键>`，元数据在同目录 `<键>.meta.json` | ❌（回 501，正文直接看文件） |
+| `s3` | 生产 | S3 兼容桶（腾讯 COS / MinIO） | ✅ SDK SigV4 |
+
+```toml
+# 本地文件（默认；重启不丢，能直接看）
+[objects]
+kind = "file"
+dir = "data/objects"
+
+# 腾讯 COS / MinIO
+[objects]
+kind = "s3"
+bucket = "wist-evidence"
+endpoint = "${SEC_COS_ENDPOINT}"
+region = "${SEC_COS_REGION}"
+access_key = "${SEC_COS_SECRET_ID}"
+secret_key = "${SEC_COS_SECRET_KEY}"
+```
+
+本地模式的文件布局就是对象键：`<租户>/<kind>/<年>/<月>/<artifact_id>.<ext>.zst`，
+同目录下 `.meta.json` 是那次写入的 7 个自描述字段。正文是 **zstd** 压缩的，
+直接看内容：`zstd -dc <文件> | jq .`。
 
 ## 构建
 

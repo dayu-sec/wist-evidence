@@ -210,5 +210,18 @@ fn read_error_response(error: ReadError) -> Response {
             })),
         )
             .into_response(),
+        // `objects.kind = file`：本地目录没有可对外下发的签名 URL。
+        ReadError::Unsupported(message) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "evidence_presign_unsupported",
+                    "message": format!(
+                        "{message}：本地文件模式不签发预签名 URL，正文在证据服务的 objects.dir 下（要签名 URL 请用 objects.kind = s3）"
+                    )
+                }
+            })),
+        )
+            .into_response(),
     }
 }

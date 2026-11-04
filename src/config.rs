@@ -57,6 +57,8 @@ pub enum IndexKind {
 #[derive(Debug, Clone)]
 pub struct ObjectsConfig {
     pub kind: ObjectsKind,
+    /// `kind = file`：本地目录的根（证据正文落在这里，方便测试与现场核对）。
+    pub dir: Option<String>,
     pub bucket: String,
     pub endpoint: Option<String>,
     pub region: Option<String>,
@@ -64,9 +66,15 @@ pub struct ObjectsConfig {
     pub secret_key: Option<String>,
 }
 
+/// 证据正文的两种落点：
+///
+/// - [`ObjectsKind::File`]：本地目录。测试 / 现场验证用，重启不丢、能直接看文件；
+/// - [`ObjectsKind::S3`]：S3 兼容对象存储（腾讯 COS / MinIO）。生产用。
+///
+/// 没有「内存」这一档：正文丢了就再也要不回来，不该成为一个部署选项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectsKind {
-    Memory,
+    File,
     S3,
 }
 
@@ -205,6 +213,8 @@ impl Default for RawIndex {
 struct RawObjects {
     #[serde(default = "default_objects_kind")]
     kind: String,
+    #[serde(default = "default_objects_dir")]
+    dir: String,
     #[serde(default = "default_bucket")]
     bucket: String,
     #[serde(default)]
@@ -221,6 +231,7 @@ impl Default for RawObjects {
     fn default() -> Self {
         Self {
             kind: default_objects_kind(),
+            dir: default_objects_dir(),
             bucket: default_bucket(),
             endpoint: String::new(),
             region: String::new(),
@@ -246,7 +257,10 @@ fn default_index_kind() -> String {
     "memory".to_string()
 }
 fn default_objects_kind() -> String {
-    "memory".to_string()
+    "file".to_string()
+}
+fn default_objects_dir() -> String {
+    "data/objects".to_string()
 }
 fn default_bucket() -> String {
     "wist-evidence-dev".to_string()
@@ -313,14 +327,19 @@ impl RawConfig {
         }
 
         let objects_kind = match self.objects.kind.trim() {
-            "memory" => ObjectsKind::Memory,
+            "file" => ObjectsKind::File,
             "s3" => ObjectsKind::S3,
-            other => bail!("objects.kind must be memory|s3, got {other:?}"),
+            other => bail!("objects.kind must be file|s3, got {other:?}"),
         };
+        let dir = optional_expanded(env, &self.objects.dir)?;
         let endpoint = optional_expanded(env, &self.objects.endpoint)?;
         let region = optional_expanded(env, &self.objects.region)?;
         let access_key = optional_expanded(env, &self.objects.access_key)?;
         let secret_key = optional_expanded(env, &self.objects.secret_key)?;
+        if objects_kind == ObjectsKind::File && dir.is_none() {
+            // 相对路径相对进程工作目录；容器里给绝对路径（挂载点）。
+            bail!("objects.kind = file requires objects.dir");
+        }
         if objects_kind == ObjectsKind::S3 {
             if endpoint.is_none() || region.is_none() {
                 bail!("objects.kind = s3 requires objects.endpoint and objects.region");
@@ -346,6 +365,7 @@ impl RawConfig {
             },
             objects: ObjectsConfig {
                 kind: objects_kind,
+                dir,
                 bucket: self.objects.bucket,
                 endpoint,
                 region,
@@ -402,9 +422,59 @@ mod tests {
         )
         .expect("dev config should parse");
         assert_eq!(config.index.kind, IndexKind::Memory);
-        assert_eq!(config.objects.kind, ObjectsKind::Memory);
+        // 没有「内存对象存储」这一档：默认就是本地目录，重启不丢。
+        assert_eq!(config.objects.kind, ObjectsKind::File);
+        assert_eq!(config.objects.dir.as_deref(), Some("data/objects"));
         assert_eq!(config.sink.allowed_kinds, vec![Kind::InvestigationReport]);
         assert_eq!(config.sink.tokens.len(), 1);
+    }
+
+    #[test]
+    fn file_objects_require_a_directory() {
+        let error = parse(
+            r#"
+            [sink.tokens.tok_dev]
+            tenant_id = "t-001"
+            customer_id = "c-001"
+            [objects]
+            kind = "file"
+            dir = ""
+            "#,
+        )
+        .expect_err("file without dir must fail");
+        assert!(error.to_string().contains("requires objects.dir"));
+    }
+
+    #[test]
+    fn s3_objects_require_credentials() {
+        let error = parse(
+            r#"
+            [sink.tokens.tok_dev]
+            tenant_id = "t-001"
+            customer_id = "c-001"
+            [objects]
+            kind = "s3"
+            endpoint = "https://cos.ap-shanghai.myqcloud.com"
+            region = "ap-shanghai"
+            "#,
+        )
+        .expect_err("s3 without keys must fail");
+        assert!(error.to_string().contains("objects.access_key"));
+    }
+
+    #[test]
+    fn unknown_objects_kind_is_rejected() {
+        let error = parse(
+            r#"
+            [sink.tokens.tok_dev]
+            tenant_id = "t-001"
+            customer_id = "c-001"
+            [objects]
+            kind = "memory"
+            "#,
+        )
+        .expect_err("memory is no longer a deployable kind");
+        assert!(error.to_string().contains("file|s3"));
     }
 
     #[test]

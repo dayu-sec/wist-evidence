@@ -1,11 +1,17 @@
 //! 对象层：证据正文唯一的落点。
 //!
+//! 两种部署形态、一个 trait：
+//! - [`FileObjectStore`]：本地目录。测试与现场验证用 —— 重启不丢，可以直接看文件；
+//! - `s3`：S3 兼容对象存储（腾讯 COS / MinIO）。生产用。
+//!
 //! 抽成 trait 的理由不是"以后可能换云"，而是**让契约测试不需要真 COS**：
 //! 幂等、键布局、元数据重建这些行为都必须在内存实现上就能验。
+//! [`MemoryObjectStore`] 现在**只给单元测试**，不再是可部署的配置项。
 //!
 //! 生产实现（`s3` feature）只做 PUT / GET / 预签名，不做 List（对账作业才需要）。
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -47,9 +53,9 @@ pub trait ObjectStore: Send + Sync {
     async fn presign_get(&self, key: &str, ttl: Duration) -> Result<String, StoreError>;
 }
 
-/// 进程内对象存储：只给测试与本地联调用。
+/// 进程内对象存储：**只给单元/契约测试**（已不是部署选项）。
 ///
-/// 它**故意**不落盘：跑完即丢，避免有人拿它当"本地证据库"（那条路会退化成第二个数据库）。
+/// 它不落盘：跑完即丢。要落盘用 [`FileObjectStore`]，要上云用 S3。
 #[derive(Debug, Default)]
 pub struct MemoryObjectStore {
     objects: RwLock<HashMap<String, StoredObject>>,
@@ -129,6 +135,103 @@ fn sign_for_test(key: &str, expires: i64) -> String {
     hasher.update(key.as_bytes());
     hasher.update(expires.to_be_bytes());
     hex::encode(&hasher.finalize()[..8])
+}
+
+/// 本地目录实现：`<dir>/<object_key>` 存正文，`<dir>/<object_key>.meta.json` 存元数据。
+///
+/// 给测试与现场核对用：重启不丢，能直接 `find` / `zstd -d` 看。
+/// 预签名在这里没有意义（没有一个外部能直连的桶），所以 `presign_get` 明确报不支持 ——
+/// 需要签名 URL 就切 `objects.kind = s3`。
+#[derive(Debug)]
+pub struct FileObjectStore {
+    root: PathBuf,
+}
+
+impl FileObjectStore {
+    /// 开目录（幂等）。拿不到写权限就在启动时失败，而不是到第一次写入才炸。
+    pub fn open(root: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let root = root.into();
+        std::fs::create_dir_all(&root)?;
+        Ok(Self { root })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// 键 → 绝对路径。键本来由服务端拼（已是安全段），这里仍拒一次路径穿越。
+    fn path_for(&self, key: &str) -> Result<PathBuf, StoreError> {
+        if key.is_empty()
+            || key.starts_with('/')
+            || key
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        {
+            return Err(StoreError::Backend(format!("unsafe object key {key:?}")));
+        }
+        Ok(self.root.join(key))
+    }
+
+    fn meta_path(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".meta.json");
+        PathBuf::from(name)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FileObjectStore {
+    async fn put(&self, key: &str, bytes: Vec<u8>, meta: &ObjectMeta) -> Result<(), StoreError> {
+        let path = self.path_for(key)?;
+        let meta_path = Self::meta_path(&path);
+        // 元数据按 S3 同口径存成 `{name: value}`，便于直接从文件重建索引。
+        let meta_json: std::collections::BTreeMap<&str, &str> = meta
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let meta_bytes = serde_json::to_vec_pretty(&meta_json)
+            .map_err(|err| StoreError::Backend(format!("serialize object meta: {err}")))?;
+
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    StoreError::Backend(format!("create {}: {err}", parent.display()))
+                })?;
+            }
+            // 先写临时文件再 rename：半截文件不会被当成完整对象读到。
+            let tmp = path.with_extension("partial");
+            std::fs::write(&tmp, &bytes)
+                .map_err(|err| StoreError::Backend(format!("write {}: {err}", tmp.display())))?;
+            std::fs::rename(&tmp, &path)
+                .map_err(|err| StoreError::Backend(format!("rename {}: {err}", path.display())))?;
+            std::fs::write(&meta_path, &meta_bytes).map_err(|err| {
+                StoreError::Backend(format!("write {}: {err}", meta_path.display()))
+            })?;
+            Ok(())
+        })
+        .await
+        .map_err(|err| StoreError::Backend(format!("object task failed: {err}")))?
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let path = self.path_for(key)?;
+        tokio::task::spawn_blocking(move || match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(StoreError::Backend(format!(
+                "read {}: {err}",
+                path.display()
+            ))),
+        })
+        .await
+        .map_err(|err| StoreError::Backend(format!("object task failed: {err}")))?
+    }
+
+    async fn presign_get(&self, _key: &str, _ttl: Duration) -> Result<String, StoreError> {
+        Err(StoreError::Unsupported(
+            "presign on the local file backend (objects.kind = file)",
+        ))
+    }
 }
 
 #[cfg(feature = "s3")]
@@ -260,5 +363,81 @@ mod s3 {
                 .map_err(|err| StoreError::Backend(format!("presign {key} failed: {err}")))?;
             Ok(request.uri().to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "wist-evidence-objects-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    #[tokio::test]
+    async fn file_backend_writes_body_and_metadata_sidecar() {
+        let root = temp_root("roundtrip");
+        let store = FileObjectStore::open(&root).expect("open");
+        let key = "t-001/investigation_report/2026/11/art_01.zst";
+        let meta = vec![
+            ("tenant-id".to_string(), "t-001".to_string()),
+            ("sha256".to_string(), "abc".to_string()),
+        ];
+
+        store
+            .put(key, b"compressed-body".to_vec(), &meta)
+            .await
+            .expect("put");
+
+        // 正文落在磁盘上（重启不丢），元数据在同一目录的 sidecar 里。
+        let body = std::fs::read(root.join(key)).expect("body file");
+        assert_eq!(body, b"compressed-body");
+        let sidecar = std::fs::read_to_string(FileObjectStore::meta_path(&root.join(key)))
+            .expect("meta sidecar");
+        assert!(sidecar.contains("\"tenant-id\": \"t-001\""));
+
+        let read_back = store.get(key).await.expect("get").expect("present");
+        assert_eq!(read_back, b"compressed-body");
+        assert!(
+            store
+                .get("t-001/missing/2026/11/nope.zst")
+                .await
+                .expect("get")
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn file_backend_rejects_unsafe_keys() {
+        let root = temp_root("unsafe");
+        let store = FileObjectStore::open(&root).expect("open");
+        for key in ["../escape", "/abs/path", "a//b", "a/./b"] {
+            assert!(
+                store.put(key, Vec::new(), &Vec::new()).await.is_err(),
+                "{key} must be rejected"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn file_backend_has_no_presign() {
+        let root = temp_root("presign");
+        let store = FileObjectStore::open(&root).expect("open");
+        let error = store
+            .presign_get("t-001/x/2026/11/art.zst", Duration::from_secs(60))
+            .await
+            .expect_err("file backend cannot presign");
+        assert!(matches!(error, StoreError::Unsupported(_)));
+        std::fs::remove_dir_all(&root).ok();
     }
 }

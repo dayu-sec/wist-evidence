@@ -1,6 +1,18 @@
 # CHANGELOG
 
-## 0.1.6 · 2026-11-02
+## 0.1.7 · 2026-11-04
+
+- 对象存储改成**两种模式**，去掉可部署的「内存」档（正文丢了就再也要不回来）：
+  - `objects.kind = "file"`（默认）：正文落本地目录 `<objects.dir>/<键>`，
+    同目录 `<键>.meta.json` 存元数据；重启不丢，测试与现场核对直接看文件。
+  - `objects.kind = "s3"`：S3 兼容桶（腾讯 COS / MinIO），行为不变。
+- 本地文件模式**不支持预签名**（没有外部可直连的桶）：`:presign` 回
+  `501 evidence_presign_unsupported` 并说明正文在哪里；要签名 URL 就切 `s3`。
+- 写入先写临时文件再 `rename`，半截文件不会被当成完整对象读到；对象键再做一次
+  路径穿越拒绝（`..`、绝对路径、空段）。
+- **不兼容**：`objects.kind = "memory"` 现在启动即报错（允许值 `file|s3`）。
+
+## 0.1.6 · 2026-11-04
 
 - 写端点新增 **Basic 认证**：`username` = 站点 token（`password` 留空）。
   这是给 warp-parse http 连接器用的 —— 它只有 `username` / `password` 两个稳定字段，

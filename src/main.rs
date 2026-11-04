@@ -6,9 +6,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use wist_evidence::api::{self, ReadState, SinkState};
 use wist_evidence::config::{Config, IndexKind, ObjectsKind};
+use wist_evidence::infra::FileObjectStore;
 use wist_evidence::infra::Index;
 use wist_evidence::infra::MemoryIndex;
-use wist_evidence::infra::MemoryObjectStore;
 use wist_evidence::infra::ObjectStore;
 use wist_evidence::service::EvidenceService;
 
@@ -104,9 +104,19 @@ async fn build_index(config: &Config) -> anyhow::Result<Arc<dyn Index>> {
 
 fn build_objects(config: &Config) -> anyhow::Result<Arc<dyn ObjectStore>> {
     match config.objects.kind {
-        ObjectsKind::Memory => {
-            log::warn!("objects.kind = memory: evidence bodies are discarded on exit (dev only)");
-            Ok(Arc::new(MemoryObjectStore::new()))
+        ObjectsKind::File => {
+            let dir = config
+                .objects
+                .dir
+                .as_deref()
+                .context("objects.dir is required for objects.kind = file")?;
+            let store =
+                FileObjectStore::open(dir).with_context(|| format!("open objects.dir {dir}"))?;
+            log::info!(
+                "objects.kind = file: evidence bodies under {} (no presigned URLs)",
+                store.root().display()
+            );
+            Ok(Arc::new(store))
         }
         ObjectsKind::S3 => {
             #[cfg(feature = "s3")]

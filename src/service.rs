@@ -95,7 +95,10 @@ pub enum ReadError {
     NotFound,
     /// 调用方没有读权限（也是 404，见 §7.2）。
     Forbidden,
+    /// 后端失败（5xx）。
     Backend(String),
+    /// 当前对象存储实现不支持这个动作（例如本地目录存储没有预签名）。
+    Unsupported(String),
 }
 
 /// 读调用方。P0 由内网 TLS 终结层注入请求头；CA-I 落地后改成证书 claim（§9.5 / §19-10）。
@@ -421,7 +424,12 @@ impl EvidenceService {
             .objects
             .presign_get(&artifact.object_key, ttl)
             .await
-            .map_err(|err| ReadError::Backend(err.to_string()))?;
+            .map_err(|err| match err {
+                crate::infra::StoreError::Unsupported(action) => {
+                    ReadError::Unsupported(action.to_string())
+                }
+                other => ReadError::Backend(other.to_string()),
+            })?;
         // P0 的审计就是这一行（落库的 evidence_audit 表在 P1）。
         log::info!(
             "evidence_presign tenant={} artifact={} kind={} ttl_s={}",
