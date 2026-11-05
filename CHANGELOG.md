@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 0.1.12 · 2026-11-05
+
+- **写入契约简化成三个字段**：`{cust_id, cmd_id, content}`（可选 `subject`）。
+  数据面不再构造信封，也不用学 `kind` / `schema` / `sensitivity`（取部署默认值）。
+  `cust_id` 同时就是租户：对象键第一段、索引分区列都用它。
+- **写端点不再校验身份**（内网可信），HTTPS 双向认证在 P1 接管。站点 token 表、
+  `[sink].auth`、旧信封（`IVSREP`）整条路都删掉了。
+- 新增**写探针**：每 5 分钟往自己的写端点投一条真证据，验「路由 → 对象 → 索引」，
+  结果在 `/healthz` 的 `probe` 块里；探针产物按 `_probe` 标记，过期每小时清一次，
+  且不出现在证据列表里。
+- `objects.kind` / `objects.bucket` 支持 `${VAR}`：用 `EVIDENCE_STORE_KIND=file|s3`
+  切存储不用改配置文件；file 模式下解析不出的 COS 占位符会被忽略（s3 仍 fail-closed）。
+
 ## 0.1.11 · 2026-11-04
 
 - `[sink].listen_addr` 与 `[read].listen_addr` 支持 `${VAR}` 展开（与其它字段同口径）。
