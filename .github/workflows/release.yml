@@ -91,16 +91,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 国内镜像源（腾讯云 TCR）：国内服务器拉 ghcr.io 很慢，客户端改用 TCR 地址。
+      # 凭据在 TCR 控制台生成（访问凭证，需 push 权限），存 GitHub Secrets：
+      # TCR_USERNAME / TCR_PASSWORD；仓库也要先在 TCR 控制台建好（namespace `cloud`）。
+      - name: Login to TCR
+        uses: docker/login-action@v3
+        with:
+          registry: dy-sec.tencentcloudcr.com
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+
       - name: Compute image tags
         id: meta
         run: |
-          # 预发布 tag 只推该 tag，不覆盖 :latest（stack 按固定 tag 拉）。
+          # 预发布 tag 只推该 tag，**不覆盖 :latest**。
+          # 两个源（ghcr / TCR）同进退：客户端只选一个地址，不该出现“一边有一边没有”。
+          tcr="dy-sec.tencentcloudcr.com/cloud/${{ github.event.repository.name }}"
           tags="ghcr.io/${{ github.repository }}:${{ github.ref_name }}"
+          tags="$(printf '%s\n%s' "$tags" "$tcr:${{ github.ref_name }}")"
           case "${{ github.ref_name }}" in
             *-*)
               ;;
             *)
               tags="$(printf '%s\n%s' "$tags" "ghcr.io/${{ github.repository }}:latest")"
+              tags="$(printf '%s\n%s' "$tags" "$tcr:latest")"
               ;;
           esac
           printf 'tags<<__EOF__\n%s\n__EOF__\n' "$tags" >> "$GITHUB_OUTPUT"
