@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## 0.1.13 · 2026-11-05
+
+- 无代码变更：**仅为把镜像同步到 TCR** 而重发。0.1.12 的 tag 早于 release 工作流
+  增加 TCR 推送，所以 `dy-sec.tencentcloudcr.com/cloud/wist-evidence:v0.1.12-alpha` 一直不存在
+  —— 栈切到 TCR 时就是 `manifest unknown`。之后的版本两个源（ghcr / TCR）同进退。
+
 ## 0.1.12 · 2026-11-05
 
 - **写入契约简化成三个字段**：`{cust_id, cmd_id, content}`（可选 `subject`）。
