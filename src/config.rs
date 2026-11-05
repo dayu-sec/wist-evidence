@@ -358,13 +358,15 @@ impl RawConfig {
 
         Ok(Config {
             sink: SinkConfig {
-                listen_addr: self.sink.listen_addr,
+                // 监听地址也允许 `${VAR}`：容器里让编排决定端口，避免端口写死在
+                // 配置、compose 健康检查、上游 base_url 三处各一份。
+                listen_addr: expand(env, &self.sink.listen_addr)?,
                 max_body_bytes: self.sink.max_body_bytes,
                 allowed_kinds,
                 tokens,
             },
             read: ReadConfig {
-                listen_addr: self.read.listen_addr,
+                listen_addr: expand(env, &self.read.listen_addr)?,
             },
             index: IndexConfig {
                 kind: index_kind,
@@ -397,6 +399,49 @@ mod tests {
     fn parse(raw: &str) -> anyhow::Result<Config> {
         let raw: RawConfig = toml::from_str(raw)?;
         raw.resolve(&EnvDict::new())
+    }
+
+    #[test]
+    fn listen_addr_can_come_from_the_environment() {
+        // 容器里让编排决定端口：配置、compose 健康检查、上游 base_url 只认一个来源。
+        let mut env = EnvDict::new();
+        env.insert("EVIDENCE_READ_PORT", ValueType::from("9443"));
+        env.insert("EVIDENCE_SINK_PORT", ValueType::from("9080"));
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [sink]
+            listen_addr = "0.0.0.0:${EVIDENCE_SINK_PORT}"
+            [sink.tokens.tok_dev]
+            tenant_id = "t-001"
+            customer_id = "c-001"
+            [read]
+            listen_addr = "0.0.0.0:${EVIDENCE_READ_PORT}"
+            "#,
+        )
+        .expect("toml");
+        let config = raw.resolve(&env).expect("listen addrs should expand");
+        assert_eq!(config.sink.listen_addr, "0.0.0.0:9080");
+        assert_eq!(config.read.listen_addr, "0.0.0.0:9443");
+    }
+
+    #[test]
+    fn unresolved_listen_addr_is_rejected() {
+        let error = parse(
+            r#"
+            [sink.tokens.tok_dev]
+            tenant_id = "t-001"
+            customer_id = "c-001"
+            [read]
+            listen_addr = "0.0.0.0:${EVIDENCE_READ_PORT}"
+            "#,
+        )
+        .expect_err("unresolved port must not become a literal bind address");
+        assert!(
+            error
+                .to_string()
+                .contains("unresolved environment variable"),
+            "{error}"
+        );
     }
 
     #[test]

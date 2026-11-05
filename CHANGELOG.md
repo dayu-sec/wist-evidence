@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## 0.1.11 · 2026-11-04
+
+- `[sink].listen_addr` 与 `[read].listen_addr` 支持 `${VAR}` 展开（与其它字段同口径）。
+  容器里可以由编排决定端口，不必把 `8443` 同时写进配置、compose 健康检查和上游 `base_url`。
+  未解析仍然 fail-closed（报 `unresolved environment variable`，不会把字面占位符当地址去 bind）。
+
 ## 0.1.10 · 2026-11-04
 
 - 新增 `GET /internal/evidence/{artifact_id}/content`：**代理读正文**（设计稿 §7.2 预留的那条）。
