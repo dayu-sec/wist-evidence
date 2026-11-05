@@ -24,50 +24,46 @@
 
 | 面 | 端口 | 身份 | 为什么分开 |
 |---|---|---|---|
-| 写 | `sink.listen_addr`（明文） | 站点 token（`Authorization`） | wparse 的 `http_sink` **没有 TLS 参数**，只能明文 + 内网 |
+| 写 | `sink.listen_addr`（明文） | 先放宽（内网可信），P1 换 HTTPS 双向认证 | wparse 的 `http_sink` **没有 TLS 参数**，只能明文 + 内网 |
 | 读 / 删 | `read.listen_addr` | mTLS + scope（P0 由内网 TLS 终结层注入请求头） | 预签名 URL 是 bearer，读侧必须能证明调用方是谁 |
 
-> 写端点**不能**和读端点共用端口：混在一起就得让写路径容忍"没有证书"的流量。
+> 写端点**不能**和读端点共用端口：混在一起就得让读路径容忍"没有证书"的流量。
 
 ## 写入接口（数据面 / 脚本）
 
 ```text
 POST /internal/evidence
-Authorization: Bearer <站点 token>        # 或 Basic base64(<站点 token>:)
 Content-Type: application/json
+# 无认证（内网可信）；认证在 P1 由 HTTPS 双向认证接管
 ```
 
-- **监听**：`[sink].listen_addr`（默认 `0.0.0.0:8080`，明文，只在内网）；
-- **认证**：
-  - `Bearer <token>`：网关 / 脚本；
-  - `Basic base64(<token>:)`：**warp-parse 的 http 连接器**用这个 —— `username` = token、
-    `password` 留空（连接器只有 username/password 两个稳定字段，不依赖 header 里的 `${VAR}` 展开）；
-  - token 来自 `[sink.tokens]` 的**键**（可用 `${SEC_...}` 引用密钥文件）。
+### 三字段
 
-请求体是 wparse 的记录（**单对象或数组**）：
+数据面只需要说清三件事：**谁的、哪次动作、产物是什么**。
 
 ```json
 {
-  "schema": "IVSREP",
-  "agent": "agent-7f3",
-  "ts": "2026-11-01T00:00:00Z",
-  "seq": 1,
-  "sensitivity": "paths",
-  "body": "{\"command_id\":\"cmd-...\",\"report_schema\":\"wist.investigation.disk/v1\",...}"
+  "cust_id": "c-001",
+  "cmd_id": "cmd-20261105-001",
+  "content": { "任意证据内容": "字符串或 JSON 都行" }
 }
 ```
 
-| 字段 | 必填 | 缺省 / 说明 |
+| 字段 | 必填 | 说明 |
 |---|---|---|
-| `schema` | ✅ | 只认 `IVSREP`（→ `kind=investigation_report`）；其它帧标记 `400` |
-| `agent` | ✅ | 信封里的主体；也是对象键的 `subject_id`（`../`、`/` 等非法段直接 `400`） |
-| `body` | ✅ | 契约对象的 **JSON 字符串**（与网关 `api/ingest.rs` 同一条纪律） |
-| `sensitivity` | — | 缺省 `paths`（调查报告 30 天） |
-| `durability` | — | 缺省 `best_effort` |
-| `ts` | — | 缺省 = 服务端收到的时间 |
-| `sha256` | — | 写入方自报；与计算结果不符 → `422` |
+| `cust_id` | ✅ | 客户。**它同时就是租户**：对象键第一段、索引分区键都用它 |
+| `cmd_id` | ✅ | 命令/动作 id，**幂等键**（同客户同 `cust_id` + `cmd_id` 且内容相同 → 重投） |
+| `content` | ✅ | 证据正文；给字符串原样存，给 JSON 对象则序列化后存 |
+| `subject` | — | 覆盖主体标识，缺省 = `cust_id`（探针用保留值 `_probe`） |
 
-**幂等**：同 `(tenant, kind, subject, command_id)` 且 `sha256` 相同 → `200` + 同一个
+`kind` / `schema_id` / `sensitivity` 这些"我们自己的口径"不让接入方学：
+取 `[sink]` 的 `default_kind` / `default_schema` / `default_sensitivity`。
+
+对象键是 `{cust_id}/{kind}/{yyyy}/{mm}/{object_id}.{ext}.zst`，正文 zstd 压缩后落库。
+
+单对象或数组都收（`batch_size > 1` 是数据面的常态）。
+
+**幂等**：同 `(cust_id, kind, subject, cmd_id)` 且 `sha256` 相同 → `200` + 同一个
 `artifact_id`，不写第二个对象；同键不同正文 → 新对象 + 行内切换（旧对象保留待清）。
 
 响应：
@@ -81,11 +77,9 @@ Content-Type: application/json
 
 | 状态 | code | 含义 |
 |---|---|---|
-| 400 | `evidence_frame_not_evidence` / `evidence_subject_invalid` / `evidence_body_invalid` / `evidence_schema_missing` / `evidence_object_key_invalid` | 参数不对，重试无用 |
-| 401 | `evidence_token_missing` / `evidence_token_invalid` | 认证失败 |
-| 403 | `evidence_kind_not_allowed` / `evidence_tenant_mismatch` | 部署未开该 kind / 正文自述租户与身份不符 |
+| 400 | `evidence_record_invalid` / `evidence_body_invalid` / `evidence_subject_invalid` / `evidence_customer_invalid` / `evidence_object_key_invalid` | 参数不对，重试无用 |
+| 403 | `evidence_kind_not_allowed` | 部署未开该 kind |
 | 413 | `evidence_body_too_large` | 超过 `[sink].max_body_bytes` |
-| 422 | `evidence_integrity_failed` | 自报 sha256 与内容不符 |
 | 5xx | `evidence_write_failed` | **只有这类才该重试**（sink 会重试后落 rescue 文件） |
 
 > 5xx 的 `message` **只有一句通用文案**：后端原文（宿主绝对路径、errno、桶名）只进服务日志。
@@ -95,7 +89,8 @@ Content-Type: application/json
 ### 可直接 copy 的 wparse 配置
 
 见 [`wist-console-stack/examples/warp-parse/`](https://github.com/dayu-sec/wist-console-stack/tree/main/examples/warp-parse)：
-一个连接器 + 一个 sink 分组，配合 `EVIDENCE_SINK_URL` / `EVIDENCE_SINK_TOKEN` 两个环境变量。
+一个连接器（只负责 POST、不做字段映射）+ 一个 sink 分组；只需要 `EVIDENCE_SINK_URL`。
+OML 的输出必须是三字段 `cust_id` / `cmd_id` / `content`。
 
 ## 对象存储：两种模式
 
@@ -136,6 +131,24 @@ secret_key = "${SEC_COS_SECRET_KEY}"
 - **根目录消失 ≠ 对象不存在**：卷被卸载 / 目录被删时报后端故障，不答 404；
 - **非法键回 400**（`evidence_object_key_invalid`），不当作可重试的 5xx。
 
+## 写探针（自检）
+
+每 `interval_secs` 往**自己的写端点**投一条探针证据 —— 相当于一个内置的小号 wparse：
+同样的 URL、同样的三字段形状。它验的是整条写链路：路由 → 序列化 → 对象 → 索引。
+
+```toml
+[probe]
+enabled = true           # 默认关；测试/验证环境打开
+interval_secs = 300      # 5 分钟一条
+retention_hours = 24     # 探针产物活多久
+# url = "http://127.0.0.1:8080/internal/evidence"   # 可选；默认由 sink 监听地址推开环地址
+```
+
+- 探针产物 `subject_id = "_probe"`，**不出现在证据列表**里（按 id 仍可读）；
+- 过期探针每小时扫一次，先删对象、再删索引行；
+- 结果在 `/healthz` 的 `probe` 块里（`last_ok` / `last_at_ms` / `last_latency_ms` /
+  `consecutive_failures`），星象台的「接口可用性」页直接展示。
+
 ## 构建
 
 ```bash
@@ -157,20 +170,20 @@ cargo build --release
 > `bind sink listener ... Address already in use`。
 
 ```bash
-# 写一条（示例配置里的 tok_dev → t-001）
+# 写一条（三字段）
 curl -sS -X POST http://127.0.0.1:19173/internal/evidence \
-  -H 'Authorization: Bearer tok_dev' -H 'Content-Type: application/json' \
-  -d '{"schema":"IVSREP","agent":"agent-7f3","sensitivity":"paths","body":"{\"command_id\":\"cmd-1\",\"report_schema\":\"wist.investigation.disk/v1\",\"summary\":{\"overall\":\"warn\"},\"findings\":[{\"id\":\"disk.filesystems\"}]}"}'
+  -H 'Content-Type: application/json' \
+  -d '{"cust_id":"c-001","cmd_id":"cmd-1","content":{"report_schema":"wist.investigation.disk/v1","summary":{"overall":"warn"}}}'
 
 # 读元数据（P0 由 TLS 终结层注入身份；本机联调直接带头）
 curl -sS http://127.0.0.1:19174/internal/evidence/art_... \
-  -H 'x-evidence-tenant: t-001' \
+  -H 'x-evidence-tenant: c-001' \
   -H 'x-evidence-scopes: evidence:read' \
   -H 'x-evidence-max-sensitivity: paths'
 
 # 短签名（60s 上限）
 curl -sS -X POST 'http://127.0.0.1:19174/internal/evidence/art_...:presign' \
-  -H 'x-evidence-tenant: t-001' -H 'x-evidence-scopes: evidence:read' \
+  -H 'x-evidence-tenant: c-001' -H 'x-evidence-scopes: evidence:read' \
   -H 'x-evidence-max-sensitivity: paths' -H 'Content-Type: application/json' \
   -d '{"ttl_seconds":600}'
 ```

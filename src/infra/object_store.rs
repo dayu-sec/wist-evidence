@@ -66,6 +66,9 @@ pub trait ObjectStore: Send + Sync {
 
     /// 签一个**单对象、短命**的 GET URL（§7.1 的默认读路径）。
     async fn presign_get(&self, key: &str, ttl: Duration) -> Result<String, StoreError>;
+
+    /// 删除一个对象（对账 / 探针清理用）。**不存在视为成功**（幂等）。
+    async fn delete(&self, key: &str) -> Result<(), StoreError>;
 }
 
 /// 进程内对象存储：**只给单元/契约测试**（已不是部署选项）。
@@ -85,6 +88,15 @@ pub struct StoredObject {
 impl MemoryObjectStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 测试辅助：直接读回正文（内存后端没有磁盘可看）。
+    pub fn bytes_of(&self, key: &str) -> Option<Vec<u8>> {
+        self.objects
+            .read()
+            .expect("memory object store poisoned")
+            .get(key)
+            .map(|object| object.bytes.clone())
     }
 
     /// 测试辅助：直接读回元数据，验"索引可从对象重建"。
@@ -141,6 +153,14 @@ impl ObjectStore for MemoryObjectStore {
             "memory://objects/{key}?expires={}&signature={signature}",
             expires_at.timestamp()
         ))
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.objects
+            .write()
+            .expect("memory object store poisoned")
+            .remove(key);
+        Ok(())
     }
 }
 
@@ -324,10 +344,38 @@ impl ObjectStore for FileObjectStore {
             "presign on the local file backend (objects.kind = file)",
         ))
     }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        let path = self.path_for(key)?;
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            if !root.is_dir() {
+                return Err(objects_root_missing(&root));
+            }
+            // 正文 + 元数据一起清；不存在都当成功（清理是可重试的）。
+            remove_if_exists(&path)?;
+            remove_if_exists(&FileObjectStore::meta_path(&path))?;
+            Ok(())
+        })
+        .await
+        .map_err(|err| StoreError::Backend(format!("object task failed: {err}")))?
+    }
 }
 
 fn objects_root_missing(root: &Path) -> StoreError {
     StoreError::Backend(format!("objects root {} is missing", root.display()))
+}
+
+/// 删除文件；不存在不算错误（清理幂等）。
+fn remove_if_exists(path: &Path) -> Result<(), StoreError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(StoreError::Backend(format!(
+            "remove {}: {err}",
+            path.display()
+        ))),
+    }
 }
 
 #[cfg(feature = "s3")]
@@ -464,6 +512,17 @@ mod s3 {
                 .await
                 .map_err(|err| StoreError::Backend(format!("presign {key} failed: {err}")))?;
             Ok(request.uri().to_string())
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(|err| StoreError::Backend(format!("delete_object {key} failed: {err}")))?;
+            Ok(())
         }
     }
 }

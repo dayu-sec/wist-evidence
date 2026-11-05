@@ -13,7 +13,7 @@ use orion_variate::vars::{EnvChecker, EnvDict, EnvEvaluable, ValueType};
 use serde::Deserialize;
 
 use crate::domain::Kind;
-use crate::service::{SinkCaller, TokenMap};
+use crate::domain::kind::Sensitivity;
 
 const SEC_FILE_ENV: &str = "WIST_EVIDENCE_SEC_FILE";
 const CONFIG_ENV: &str = "WIST_EVIDENCE_CONFIG";
@@ -27,6 +27,19 @@ pub struct Config {
     pub read: ReadConfig,
     pub index: IndexConfig,
     pub objects: ObjectsConfig,
+    pub probe: ProbeConfig,
+}
+
+/// 写探针：每隔 `interval_secs` 往自己的写路径投一条探针证据，
+/// 验证「对象 + 索引」真的能写；探针产物按 `subject_id = _probe` 标记，
+/// 过了 `retention_hours` 的每 `retention_hours` 清一次。
+#[derive(Debug, Clone)]
+pub struct ProbeConfig {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub retention_hours: u64,
+    /// 覆盖探针要打的写端点 URL；默认由 `sink.listen_addr` 推回环地址。
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,7 +47,10 @@ pub struct SinkConfig {
     pub listen_addr: String,
     pub max_body_bytes: usize,
     pub allowed_kinds: Vec<Kind>,
-    pub tokens: TokenMap,
+    /// 三字段形状没带的维度，用这三个默认值补。
+    pub default_kind: Kind,
+    pub default_schema: String,
+    pub default_sensitivity: Sensitivity,
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +164,8 @@ struct RawConfig {
     index: RawIndex,
     #[serde(default)]
     objects: RawObjects,
+    #[serde(default)]
+    probe: RawProbe,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,8 +176,12 @@ struct RawSink {
     max_body_bytes: usize,
     #[serde(default = "default_allowed_kinds")]
     allowed_kinds: Vec<String>,
-    #[serde(default)]
-    tokens: std::collections::BTreeMap<String, RawToken>,
+    #[serde(default = "default_sink_kind")]
+    default_kind: String,
+    #[serde(default = "default_sink_schema")]
+    default_schema: String,
+    #[serde(default = "default_sink_sensitivity")]
+    default_sensitivity: String,
 }
 
 impl Default for RawSink {
@@ -168,15 +190,11 @@ impl Default for RawSink {
             listen_addr: default_sink_addr(),
             max_body_bytes: default_max_body_bytes(),
             allowed_kinds: default_allowed_kinds(),
-            tokens: Default::default(),
+            default_kind: default_sink_kind(),
+            default_schema: default_sink_schema(),
+            default_sensitivity: default_sink_sensitivity(),
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct RawToken {
-    tenant_id: String,
-    customer_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,6 +226,36 @@ impl Default for RawIndex {
             database_url: String::new(),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawProbe {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_probe_interval")]
+    interval_secs: u64,
+    #[serde(default = "default_probe_retention")]
+    retention_hours: u64,
+    #[serde(default)]
+    url: String,
+}
+
+impl Default for RawProbe {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_probe_interval(),
+            retention_hours: default_probe_retention(),
+            url: String::new(),
+        }
+    }
+}
+
+fn default_probe_interval() -> u64 {
+    300
+}
+fn default_probe_retention() -> u64 {
+    24
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +299,15 @@ fn default_read_addr() -> String {
 fn default_max_body_bytes() -> usize {
     HARD_MAX_BODY_BYTES
 }
+fn default_sink_kind() -> String {
+    Kind::InvestigationReport.as_str().to_string()
+}
+fn default_sink_schema() -> String {
+    "wist.evidence/v1".to_string()
+}
+fn default_sink_sensitivity() -> String {
+    "paths".to_string()
+}
 fn default_allowed_kinds() -> Vec<String> {
     vec![Kind::InvestigationReport.as_str().to_string()]
 }
@@ -275,30 +332,22 @@ impl RawConfig {
                 self.sink.max_body_bytes
             );
         }
-        if self.sink.tokens.is_empty() {
-            bail!("sink.tokens is empty: without a token every write would be rejected");
-        }
-
-        let mut tokens = TokenMap::new();
-        for (raw_token, raw) in self.sink.tokens {
-            // 站点 token 本身就是**键**：允许多写一个 `${SEC_...}`，避免把 bearer 值写进配置文件。
-            let token = expand(env, &raw_token)?;
-            if token.trim().is_empty() {
-                bail!("sink.tokens has an empty token");
-            }
-            if !crate::domain::artifact::is_safe_segment(raw.tenant_id.trim()) {
-                bail!("sink.tokens.<token>.tenant_id must be a safe key segment");
-            }
-            if raw.customer_id.trim().is_empty() {
-                bail!("sink.tokens.<token>.customer_id must not be empty");
-            }
-            tokens.insert(
-                token,
-                SinkCaller {
-                    tenant_id: raw.tenant_id.trim().to_string(),
-                    customer_id: raw.customer_id.trim().to_string(),
-                },
-            );
+        let default_kind = Kind::parse(self.sink.default_kind.trim()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "sink.default_kind has unknown kind {:?}",
+                self.sink.default_kind
+            )
+        })?;
+        let default_sensitivity = Sensitivity::parse(self.sink.default_sensitivity.trim())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "sink.default_sensitivity is unknown: {:?}",
+                    self.sink.default_sensitivity
+                )
+            })?;
+        let default_schema = self.sink.default_schema.trim().to_string();
+        if default_schema.is_empty() {
+            bail!("sink.default_schema must not be empty");
         }
 
         let mut allowed_kinds = Vec::new();
@@ -311,6 +360,12 @@ impl RawConfig {
         }
         if allowed_kinds.is_empty() {
             bail!("sink.allowed_kinds must list at least one kind");
+        }
+        if !allowed_kinds.contains(&default_kind) {
+            bail!(
+                "sink.default_kind {:?} must be listed in sink.allowed_kinds",
+                default_kind.as_str()
+            );
         }
 
         let index_kind = match self.index.kind.trim() {
@@ -327,7 +382,9 @@ impl RawConfig {
             bail!("index.kind = postgres requires index.database_url");
         }
 
-        let objects_kind = match self.objects.kind.trim() {
+        // 存储后端也由环境变量选（`EVIDENCE_STORE_KIND=file|s3`）：切换模式不需要改配置文件。
+        let raw_kind = expand(env, &self.objects.kind)?;
+        let objects_kind = match raw_kind.trim() {
             "file" => ObjectsKind::File,
             "s3" => ObjectsKind::S3,
             other => bail!(
@@ -335,14 +392,18 @@ impl RawConfig {
                  （from 0.1.7 the memory backend is gone）"
             ),
         };
-        if self.objects.bucket.trim().is_empty() {
+        let bucket = expand(env, &self.objects.bucket)?;
+        if bucket.trim().is_empty() {
             bail!("objects.bucket must not be empty");
         }
         let dir = optional_expanded(env, &self.objects.dir)?;
-        let endpoint = optional_expanded(env, &self.objects.endpoint)?;
-        let region = optional_expanded(env, &self.objects.region)?;
-        let access_key = optional_expanded(env, &self.objects.access_key)?;
-        let secret_key = optional_expanded(env, &self.objects.secret_key)?;
+        // COS 四个字段在配置文件里**常驻**（不然切模式还得改文件），所以 file 模式下
+        // 它们解析不出来只当「没配」；真选 s3 时再 fail-closed。
+        let cos_required = objects_kind == ObjectsKind::S3;
+        let endpoint = optional_expanded_lax(env, &self.objects.endpoint, cos_required)?;
+        let region = optional_expanded_lax(env, &self.objects.region, cos_required)?;
+        let access_key = optional_expanded_lax(env, &self.objects.access_key, cos_required)?;
+        let secret_key = optional_expanded_lax(env, &self.objects.secret_key, cos_required)?;
         if objects_kind == ObjectsKind::File && dir.is_none() {
             // 相对路径相对进程工作目录；容器里给绝对路径（挂载点）。
             bail!("objects.kind = file requires objects.dir");
@@ -356,6 +417,17 @@ impl RawConfig {
             }
         }
 
+        let probe_url = optional_expanded(env, &self.probe.url)?;
+        if self.probe.enabled {
+            if self.probe.interval_secs == 0 {
+                bail!("probe.interval_secs must be > 0 when probe.enabled");
+            }
+            if self.probe.retention_hours == 0 {
+                // 0 会让「清理」变成「每轮删刚写的东西」。
+                bail!("probe.retention_hours must be > 0 when probe.enabled");
+            }
+        }
+
         Ok(Config {
             sink: SinkConfig {
                 // 监听地址也允许 `${VAR}`：容器里让编排决定端口，避免端口写死在
@@ -363,7 +435,9 @@ impl RawConfig {
                 listen_addr: expand(env, &self.sink.listen_addr)?,
                 max_body_bytes: self.sink.max_body_bytes,
                 allowed_kinds,
-                tokens,
+                default_kind,
+                default_schema,
+                default_sensitivity,
             },
             read: ReadConfig {
                 listen_addr: expand(env, &self.read.listen_addr)?,
@@ -375,11 +449,17 @@ impl RawConfig {
             objects: ObjectsConfig {
                 kind: objects_kind,
                 dir,
-                bucket: self.objects.bucket,
+                bucket,
                 endpoint,
                 region,
                 access_key,
                 secret_key,
+            },
+            probe: ProbeConfig {
+                enabled: self.probe.enabled,
+                interval_secs: self.probe.interval_secs,
+                retention_hours: self.probe.retention_hours,
+                url: probe_url,
             },
         })
     }
@@ -392,6 +472,31 @@ fn optional_expanded(env: &EnvDict, value: &str) -> anyhow::Result<Option<String
     Ok(Some(expand(env, value)?))
 }
 
+/// 可选字段的宽容版：解析不出来时，`required` 为真才报错，否则当成「没配」。
+///
+/// 用于 `[objects]` 里常驻的 COS 四字段：本地文件模式下不该逼着部署方
+/// 去定义一堆用不到的 COS 凭据，但真选了 `kind = s3` 就必须 fail-closed。
+fn optional_expanded_lax(
+    env: &EnvDict,
+    value: &str,
+    required: bool,
+) -> anyhow::Result<Option<String>> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    let expanded: String = value.to_string().env_eval(env);
+    if expanded.needs_env_eval() {
+        if required {
+            bail!(
+                "unresolved environment variable(s) in {value:?}: {}",
+                expanded.list_env_vars().join(", ")
+            );
+        }
+        return Ok(None);
+    }
+    Ok(Some(expanded))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +504,151 @@ mod tests {
     fn parse(raw: &str) -> anyhow::Result<Config> {
         let raw: RawConfig = toml::from_str(raw)?;
         raw.resolve(&EnvDict::new())
+    }
+
+    #[test]
+    fn probe_defaults_are_off() {
+        let config = parse(
+            r#"
+            "#,
+        )
+        .expect("minimal config");
+        assert!(!config.probe.enabled, "probe must be opt-in");
+        assert_eq!(config.probe.interval_secs, 300);
+        assert_eq!(config.probe.retention_hours, 24);
+    }
+
+    #[test]
+    fn enabled_probe_rejects_zero_interval() {
+        let error = parse(
+            r#"
+            [probe]
+            enabled = true
+            interval_secs = 0
+            "#,
+        )
+        .expect_err("zero interval must fail");
+        assert!(error.to_string().contains("probe.interval_secs"));
+    }
+
+    #[test]
+    fn enabled_probe_rejects_zero_retention() {
+        // 0 会让清理变成「每轮删刚写的东西」。
+        let error = parse(
+            r#"
+            [probe]
+            enabled = true
+            retention_hours = 0
+            "#,
+        )
+        .expect_err("zero retention must fail");
+        assert!(error.to_string().contains("probe.retention_hours"));
+    }
+
+    #[test]
+    fn objects_kind_and_bucket_can_come_from_the_environment() {
+        // 切换存储后端不改配置文件：两个栈级变量说了算。
+        let mut env = EnvDict::new();
+        env.insert("EVIDENCE_STORE_KIND", ValueType::from("s3"));
+        env.insert(
+            "EVIDENCE_OBJECTS_BUCKET",
+            ValueType::from("wist-evidence-1250000000"),
+        );
+        env.insert(
+            "SEC_COS_ENDPOINT",
+            ValueType::from("https://cos.ap-shanghai.myqcloud.com"),
+        );
+        env.insert("SEC_COS_REGION", ValueType::from("ap-shanghai"));
+        env.insert("SEC_COS_SECRET_ID", ValueType::from("id"));
+        env.insert("SEC_COS_SECRET_KEY", ValueType::from("key"));
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [objects]
+            kind = "${EVIDENCE_STORE_KIND}"
+            bucket = "${EVIDENCE_OBJECTS_BUCKET}"
+            endpoint = "${SEC_COS_ENDPOINT}"
+            region = "${SEC_COS_REGION}"
+            access_key = "${SEC_COS_SECRET_ID}"
+            secret_key = "${SEC_COS_SECRET_KEY}"
+            "#,
+        )
+        .expect("toml");
+        let config = raw.resolve(&env).expect("s3 should resolve from env");
+        assert_eq!(config.objects.kind, ObjectsKind::S3);
+        assert_eq!(config.objects.bucket, "wist-evidence-1250000000");
+        assert_eq!(
+            config.objects.endpoint.as_deref(),
+            Some("https://cos.ap-shanghai.myqcloud.com")
+        );
+    }
+
+    #[test]
+    fn cos_placeholders_are_ignored_in_file_mode() {
+        // `[objects]` 里常驻着 COS 的四个 `${SEC_...}`：file 模式下没人定义它们，
+        // 不应该因此起不来。
+        let mut env = EnvDict::new();
+        env.insert("EVIDENCE_STORE_KIND", ValueType::from("file"));
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [objects]
+            kind = "${EVIDENCE_STORE_KIND}"
+            dir = "/var/lib/wist-evidence/objects"
+            endpoint = "${SEC_COS_ENDPOINT}"
+            region = "${SEC_COS_REGION}"
+            access_key = "${SEC_COS_SECRET_ID}"
+            secret_key = "${SEC_COS_SECRET_KEY}"
+            "#,
+        )
+        .expect("toml");
+        let config = raw
+            .resolve(&env)
+            .expect("file mode must not need COS creds");
+        assert_eq!(config.objects.kind, ObjectsKind::File);
+        assert!(config.objects.endpoint.is_none());
+        assert!(config.objects.access_key.is_none());
+    }
+
+    #[test]
+    fn cos_placeholders_are_required_in_s3_mode() {
+        let mut env = EnvDict::new();
+        env.insert("EVIDENCE_STORE_KIND", ValueType::from("s3"));
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [objects]
+            kind = "${EVIDENCE_STORE_KIND}"
+            endpoint = "${SEC_COS_ENDPOINT}"
+            region = "ap-shanghai"
+            access_key = "id"
+            secret_key = "key"
+            "#,
+        )
+        .expect("toml");
+        let error = raw.resolve(&env).expect_err("s3 must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("unresolved environment variable"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("SEC_COS_ENDPOINT"), "{error}");
+    }
+
+    #[test]
+    fn unresolved_store_kind_is_rejected() {
+        // 栈级变量没传进来时不能静默退回某个后端。
+        let error = parse(
+            r#"
+            [objects]
+            kind = "${EVIDENCE_STORE_KIND}"
+            "#,
+        )
+        .expect_err("unresolved kind must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unresolved environment variable"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -411,9 +661,6 @@ mod tests {
             r#"
             [sink]
             listen_addr = "0.0.0.0:${EVIDENCE_SINK_PORT}"
-            [sink.tokens.tok_dev]
-            tenant_id = "t-001"
-            customer_id = "c-001"
             [read]
             listen_addr = "0.0.0.0:${EVIDENCE_READ_PORT}"
             "#,
@@ -428,9 +675,6 @@ mod tests {
     fn unresolved_listen_addr_is_rejected() {
         let error = parse(
             r#"
-            [sink.tokens.tok_dev]
-            tenant_id = "t-001"
-            customer_id = "c-001"
             [read]
             listen_addr = "0.0.0.0:${EVIDENCE_READ_PORT}"
             "#,
@@ -445,31 +689,9 @@ mod tests {
     }
 
     #[test]
-    fn token_key_can_come_from_the_environment() {
-        let mut env = EnvDict::new();
-        env.insert("SEC_EVIDENCE_SINK_TOKEN", ValueType::from("tok_secret"));
-        let raw: RawConfig = toml::from_str(
-            r#"
-            [sink.tokens."${SEC_EVIDENCE_SINK_TOKEN}"]
-            tenant_id = "t-001"
-            customer_id = "c-001"
-            "#,
-        )
-        .expect("toml");
-        let config = raw
-            .resolve(&env)
-            .expect("token key should expand from the secret dict");
-        assert!(config.sink.tokens.contains_key("tok_secret"));
-        assert_eq!(config.sink.tokens.len(), 1);
-    }
-
-    #[test]
     fn defaults_are_dev_safe() {
         let config = parse(
             r#"
-            [sink.tokens.tok_dev]
-            tenant_id = "t-001"
-            customer_id = "c-001"
             "#,
         )
         .expect("dev config should parse");
@@ -478,16 +700,13 @@ mod tests {
         assert_eq!(config.objects.kind, ObjectsKind::File);
         assert_eq!(config.objects.dir.as_deref(), Some("data/objects"));
         assert_eq!(config.sink.allowed_kinds, vec![Kind::InvestigationReport]);
-        assert_eq!(config.sink.tokens.len(), 1);
+        assert_eq!(config.sink.default_kind, Kind::InvestigationReport);
     }
 
     #[test]
     fn file_objects_require_a_directory() {
         let error = parse(
             r#"
-            [sink.tokens.tok_dev]
-            tenant_id = "t-001"
-            customer_id = "c-001"
             [objects]
             kind = "file"
             dir = ""
@@ -501,9 +720,6 @@ mod tests {
     fn s3_objects_require_credentials() {
         let error = parse(
             r#"
-            [sink.tokens.tok_dev]
-            tenant_id = "t-001"
-            customer_id = "c-001"
             [objects]
             kind = "s3"
             endpoint = "https://cos.ap-shanghai.myqcloud.com"
@@ -518,9 +734,6 @@ mod tests {
     fn blank_objects_dir_is_rejected() {
         let error = parse(
             r#"
-            [sink.tokens.tok_dev]
-            tenant_id = "t-001"
-            customer_id = "c-001"
             [objects]
             kind = "file"
             dir = "   "
@@ -534,9 +747,6 @@ mod tests {
     fn s3_objects_require_endpoint_and_region() {
         let error = parse(
             r#"
-            [sink.tokens.tok_dev]
-            tenant_id = "t-001"
-            customer_id = "c-001"
             [objects]
             kind = "s3"
             access_key = "id"
@@ -556,9 +766,6 @@ mod tests {
         for kind in ["file", "s3"] {
             let error = parse(&format!(
                 r#"
-                [sink.tokens.tok_dev]
-                tenant_id = "t-001"
-                customer_id = "c-001"
                 [objects]
                 kind = "{kind}"
                 bucket = ""
@@ -578,9 +785,6 @@ mod tests {
         // 库里的路径决定数据落点：配置层不做任何规范化（不补斜杠、不 trim）。
         let config = parse(
             r#"
-            [sink.tokens.tok_dev]
-            tenant_id = "t-001"
-            customer_id = "c-001"
             [objects]
             kind = "file"
             dir = "./data/objects"
@@ -594,9 +798,6 @@ mod tests {
     fn unknown_objects_kind_is_rejected() {
         let error = parse(
             r#"
-            [sink.tokens.tok_dev]
-            tenant_id = "t-001"
-            customer_id = "c-001"
             [objects]
             kind = "memory"
             "#,
@@ -606,18 +807,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_tokens_are_rejected() {
-        let error = parse("").expect_err("no token must fail");
-        assert!(error.to_string().contains("sink.tokens is empty"));
-    }
-
-    #[test]
     fn postgres_without_url_is_rejected() {
         let error = parse(
             r#"
-            [sink.tokens.tok_dev]
-            tenant_id = "t-001"
-            customer_id = "c-001"
             [index]
             kind = "postgres"
             "#,
@@ -627,28 +819,12 @@ mod tests {
     }
 
     #[test]
-    fn tenant_must_be_a_safe_key_segment() {
-        let error = parse(
-            r#"
-            [sink.tokens.tok_dev]
-            tenant_id = "../other"
-            customer_id = "c-001"
-            "#,
-        )
-        .expect_err("traversal tenant must fail");
-        assert!(error.to_string().contains("safe key segment"));
-    }
-
-    #[test]
     fn unknown_kind_is_rejected() {
         let error = parse(
             r#"
             [sink]
             allowed_kinds = ["mystery_report"]
 
-            [sink.tokens.tok_dev]
-            tenant_id = "t-001"
-            customer_id = "c-001"
             "#,
         )
         .expect_err("unknown kind must fail");

@@ -17,9 +17,9 @@ use wist_evidence::domain::Kind;
 use wist_evidence::infra::{
     FileObjectStore, MemoryIndex, MemoryObjectStore, ObjectMeta, ObjectStore, StoreError,
 };
-use wist_evidence::service::{EvidenceService, SinkCaller, TokenMap};
+use wist_evidence::service::EvidenceService;
 
-const TOKEN: &str = "tok_dev";
+const CUST: &str = "c-001";
 
 struct Harness {
     sink: Router,
@@ -28,6 +28,8 @@ struct Harness {
     /// 断言用的具体后端：`None` 表示不是内存后端（file 直接看磁盘）。
     memory: Option<Arc<MemoryObjectStore>>,
     file: Option<Arc<FileObjectStore>>,
+    /// 服务本体：写探针 / 清理的测试直接从这一层调，不绕 HTTP。
+    service: Arc<EvidenceService>,
 }
 
 impl Harness {
@@ -52,6 +54,16 @@ impl Harness {
             }
             (None, None) => None,
         }
+    }
+
+    /// 读回对象正文（内存后端直接读，file 后端解压），测试断言用。
+    fn stored_body(&self, key: &str) -> Option<Vec<u8>> {
+        if let Some(memory) = &self.memory {
+            // 对象层存的是 zstd 压缩后的字节，两种后端都要解压后再断言。
+            let compressed = memory.bytes_of(key)?;
+            return zstd::decode_all(compressed.as_slice()).ok();
+        }
+        self.object_body(key)
     }
 
     /// 磁盘上的对象正文（仅 file 后端），已解压。
@@ -86,43 +98,36 @@ fn harness_with(
     objects: Arc<dyn ObjectStore>,
     memory: Option<Arc<MemoryObjectStore>>,
     file: Option<Arc<FileObjectStore>>,
+    probe_enabled: bool,
 ) -> Harness {
-    let service = Arc::new(EvidenceService::new(
+    let mut raw_service = EvidenceService::new(
         index.clone(),
         objects.clone(),
         "wist-evidence-test".to_string(),
         vec![Kind::InvestigationReport],
         4 * 1024 * 1024,
-    ));
+    );
+    if probe_enabled {
+        raw_service.enable_probe();
+    }
+    let service = Arc::new(raw_service);
 
-    let mut tokens = TokenMap::new();
-    tokens.insert(
-        TOKEN.to_string(),
-        SinkCaller {
-            tenant_id: "t-001".to_string(),
-            customer_id: "c-001".to_string(),
-        },
-    );
-    tokens.insert(
-        "tok_other".to_string(),
-        SinkCaller {
-            tenant_id: "t-002".to_string(),
-            customer_id: "c-002".to_string(),
-        },
-    );
+    let sink_state = SinkState {
+        service: service.clone(),
+        default_kind: Kind::InvestigationReport,
+        default_schema: "wist.evidence/v1".to_string(),
+        default_sensitivity: wist_evidence::domain::kind::Sensitivity::Paths,
+    };
 
     Harness {
-        sink: api::sink_router(
-            SinkState {
-                service: service.clone(),
-                tokens: Arc::new(tokens),
-            },
-            4 * 1024 * 1024,
-        ),
-        read: api::read_router(ReadState { service }),
+        sink: api::sink_router(sink_state, 4 * 1024 * 1024),
+        read: api::read_router(ReadState {
+            service: service.clone(),
+        }),
         index,
         memory,
         file,
+        service,
     }
 }
 
@@ -133,13 +138,20 @@ fn harness() -> Harness {
         memory.clone(),
         Some(memory),
         None,
+        false,
     )
 }
 
 /// 默认部署形态（`objects.kind = file`）的端到端 harness。
 fn file_harness(root: &std::path::Path) -> Harness {
     let file = Arc::new(FileObjectStore::open(root).expect("open file store"));
-    harness_with(Arc::new(MemoryIndex::new()), file.clone(), None, Some(file))
+    harness_with(
+        Arc::new(MemoryIndex::new()),
+        file.clone(),
+        None,
+        Some(file),
+        false,
+    )
 }
 
 fn report(command_id: &str, overall: &str) -> String {
@@ -154,22 +166,21 @@ fn report(command_id: &str, overall: &str) -> String {
     .to_string()
 }
 
-fn sink_record(command_id: &str, overall: &str) -> Value {
+/// 三字段写入记录：`cust_id` / `cmd_id` / `content`（+ 覆盖主体）。
+/// `content` 给字符串，这样磁盘上的对象能直接和它逐字节比对。
+fn record(cmd_id: &str, overall: &str) -> Value {
     json!({
-        "schema": "IVSREP",
-        "agent": "agent-7f3",
-        "ts": "2026-11-01T00:00:00Z",
-        "seq": 1,
-        "sensitivity": "paths",
-        "body": report(command_id, overall),
+        "cust_id": CUST,
+        "cmd_id": cmd_id,
+        "subject": "agent-7f3",
+        "content": report(cmd_id, overall),
     })
 }
 
-async fn post_record(sink: &Router, token: &str, record: Value) -> (StatusCode, Value) {
+async fn post_record(sink: &Router, record: Value) -> (StatusCode, Value) {
     let request = Request::builder()
         .method("POST")
         .uri("/internal/evidence")
-        .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&record).unwrap()))
         .unwrap();
@@ -219,7 +230,7 @@ async fn presign(read: &Router, artifact_id: &str, ttl: u64) -> (StatusCode, Val
     let request = Request::builder()
         .method("POST")
         .uri(format!("/internal/evidence/{artifact_id}:presign"))
-        .header("x-evidence-tenant", "t-001")
+        .header("x-evidence-tenant", "c-001")
         .header("x-evidence-scopes", "evidence:read")
         .header("x-evidence-max-sensitivity", "paths")
         .header("content-type", "application/json")
@@ -237,9 +248,9 @@ async fn presign(read: &Router, artifact_id: &str, ttl: u64) -> (StatusCode, Val
 #[tokio::test]
 async fn replaying_the_same_record_is_idempotent() {
     let h = harness();
-    let record = sink_record("cmd-1", "warn");
+    let record = record("cmd-1", "warn");
 
-    let (status, first) = post_record(&h.sink, TOKEN, record.clone()).await;
+    let (status, first) = post_record(&h.sink, record.clone()).await;
     assert_eq!(status, StatusCode::OK, "{first}");
     let artifact_id = first["artifacts"][0]["artifact_id"]
         .as_str()
@@ -248,7 +259,7 @@ async fn replaying_the_same_record_is_idempotent() {
     assert_eq!(first["duplicates"], 0);
 
     // sink 的 max_retries 会让重复投递成为常态：第二次必须是 200，且不产生新对象 / 新行。
-    let (status, second) = post_record(&h.sink, TOKEN, record).await;
+    let (status, second) = post_record(&h.sink, record).await;
     assert_eq!(status, StatusCode::OK, "{second}");
     assert_eq!(second["duplicates"], 1);
     assert_eq!(second["artifacts"][0]["artifact_id"], artifact_id);
@@ -261,17 +272,17 @@ async fn replaying_the_same_record_is_idempotent() {
 #[tokio::test]
 async fn cross_tenant_read_is_404() {
     let h = harness();
-    let (_, written) = post_record(&h.sink, TOKEN, sink_record("cmd-2", "ok")).await;
+    let (_, written) = post_record(&h.sink, record("cmd-2", "ok")).await;
     let artifact_id = written["artifacts"][0]["artifact_id"].as_str().unwrap();
 
     // 同租户能读。
     assert_eq!(
-        get_metadata(&h.read, "t-001", artifact_id).await,
+        get_metadata(&h.read, "c-001", artifact_id).await,
         StatusCode::OK
     );
     // 另一个租户：只能得到 404（不泄露"存在但不能看"）。
     assert_eq!(
-        get_metadata(&h.read, "t-002", artifact_id).await,
+        get_metadata(&h.read, "c-002", artifact_id).await,
         StatusCode::NOT_FOUND
     );
 }
@@ -279,11 +290,16 @@ async fn cross_tenant_read_is_404() {
 #[tokio::test]
 async fn unsafe_subject_is_rejected() {
     let h = harness();
-    for agent in ["", "..", "../other", "a/b"] {
-        let mut record = sink_record("cmd-3", "ok");
-        record["agent"] = json!(agent);
-        let (status, body) = post_record(&h.sink, TOKEN, record).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "agent={agent:?} -> {body}");
+    // 空 `subject` 不是错误：缺省回退到 `cust_id`；但不安全段没商量。
+    for subject in ["..", "../other", "a/b"] {
+        let mut record = record("cmd-3", "ok");
+        record["subject"] = json!(subject);
+        let (status, body) = post_record(&h.sink, record).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "subject={subject:?} -> {body}"
+        );
     }
     assert!(
         h.object_count() == 0,
@@ -292,32 +308,36 @@ async fn unsafe_subject_is_rejected() {
 }
 
 #[tokio::test]
-async fn unknown_frame_marker_is_400() {
+async fn unsafe_customer_is_rejected() {
     let h = harness();
-    let mut record = sink_record("cmd-4", "ok");
-    record["schema"] = json!("OBSFACT");
-    let (status, body) = post_record(&h.sink, TOKEN, record).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"]["code"], "evidence_frame_not_evidence");
+    for cust in ["..", "../other", "a/b", ""] {
+        let mut record = record("cmd-3b", "ok");
+        record["cust_id"] = json!(cust);
+        let (status, body) = post_record(&h.sink, record).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "cust={cust:?} -> {body}");
+        assert_eq!(body["error"]["code"], "evidence_customer_invalid", "{body}");
+    }
 }
 
 #[tokio::test]
-async fn tenant_claim_in_body_must_match_the_token() {
+async fn missing_fields_are_400() {
     let h = harness();
-    let mut record = sink_record("cmd-5", "ok");
-    let mut body: Value = serde_json::from_str(record["body"].as_str().unwrap()).unwrap();
-    body["tenant_id"] = json!("t-002");
-    record["body"] = json!(body.to_string());
-
-    let (status, response) = post_record(&h.sink, TOKEN, record).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
-    assert_eq!(response["error"]["code"], "evidence_tenant_mismatch");
+    // 三字段都是必填：少了任何一个都不能默一个值应付过去。
+    for broken in [
+        json!({ "cmd_id": "cmd-x", "content": "x" }),
+        json!({ "cust_id": CUST, "content": "x" }),
+        json!({ "cust_id": CUST, "cmd_id": "cmd-x" }),
+    ] {
+        let (status, body) = post_record(&h.sink, broken.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{broken} -> {body}");
+    }
+    assert_eq!(h.object_count(), 0);
 }
 
 #[tokio::test]
 async fn presign_is_single_object_and_capped_at_60s() {
     let h = harness();
-    let (_, written) = post_record(&h.sink, TOKEN, sink_record("cmd-6", "warn")).await;
+    let (_, written) = post_record(&h.sink, record("cmd-6", "warn")).await;
     let artifact_id = written["artifacts"][0]["artifact_id"].as_str().unwrap();
 
     let (status, signed) = presign(&h.read, artifact_id, 600).await;
@@ -339,13 +359,13 @@ async fn presign_is_single_object_and_capped_at_60s() {
 #[tokio::test]
 async fn same_command_with_new_body_supersedes_the_row() {
     let h = harness();
-    let (_, first) = post_record(&h.sink, TOKEN, sink_record("cmd-7", "warn")).await;
+    let (_, first) = post_record(&h.sink, record("cmd-7", "warn")).await;
     let artifact_id = first["artifacts"][0]["artifact_id"]
         .as_str()
         .unwrap()
         .to_string();
 
-    let (status, second) = post_record(&h.sink, TOKEN, sink_record("cmd-7", "fail")).await;
+    let (status, second) = post_record(&h.sink, record("cmd-7", "fail")).await;
     assert_eq!(status, StatusCode::OK, "{second}");
     assert_eq!(second["artifacts"][0]["artifact_id"], artifact_id);
     assert_eq!(second["artifacts"][0]["superseded"], true);
@@ -361,7 +381,7 @@ async fn same_command_with_new_body_supersedes_the_row() {
 #[tokio::test]
 async fn object_metadata_carries_the_rebuild_fields() {
     let h = harness();
-    post_record(&h.sink, TOKEN, sink_record("cmd-8", "ok")).await;
+    post_record(&h.sink, record("cmd-8", "ok")).await;
 
     let artifact = h.index.all().into_iter().next().unwrap();
     let meta = h.object_meta(&artifact.object_key).unwrap();
@@ -384,21 +404,21 @@ async fn object_metadata_carries_the_rebuild_fields() {
 #[tokio::test]
 async fn list_returns_newest_first_and_respects_visibility() {
     let h = harness();
-    post_record(&h.sink, TOKEN, sink_record("cmd-a", "warn")).await;
-    post_record(&h.sink, TOKEN, sink_record("cmd-b", "ok")).await;
+    post_record(&h.sink, record("cmd-a", "warn")).await;
+    post_record(&h.sink, record("cmd-b", "ok")).await;
 
-    let (status, page) = list(&h.read, "t-001", "paths", "").await;
+    let (status, page) = list(&h.read, "c-001", "paths", "").await;
     assert_eq!(status, StatusCode::OK, "{page}");
     let artifacts = page["artifacts"].as_array().unwrap();
     assert_eq!(artifacts.len(), 2);
     assert!(page["next_cursor"].is_null());
 
     // 类型筛选
-    let (_, filtered) = list(&h.read, "t-001", "paths", "?kind=diagnose_report").await;
+    let (_, filtered) = list(&h.read, "c-001", "paths", "?kind=diagnose_report").await;
     assert_eq!(filtered["artifacts"].as_array().unwrap().len(), 0);
 
     // 跨租户：身份里没有 t-002 的数据 → 空列表（不是 403，避免泄露存在性）。
-    let (status, other) = list(&h.read, "t-002", "paths", "").await;
+    let (status, other) = list(&h.read, "c-002", "paths", "").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(other["artifacts"].as_array().unwrap().len(), 0);
 }
@@ -406,59 +426,14 @@ async fn list_returns_newest_first_and_respects_visibility() {
 #[tokio::test]
 async fn list_hides_artifacts_above_the_caller_sensitivity() {
     let h = harness();
-    post_record(&h.sink, TOKEN, sink_record("cmd-c", "warn")).await; // sensitivity=paths
+    post_record(&h.sink, record("cmd-c", "warn")).await; // sensitivity=paths
 
-    let (status, page) = list(&h.read, "t-001", "metrics", "").await;
+    let (status, page) = list(&h.read, "c-001", "metrics", "").await;
     assert_eq!(status, StatusCode::OK, "{page}");
     assert_eq!(page["artifacts"].as_array().unwrap().len(), 0);
 
-    let (_, visible) = list(&h.read, "t-001", "paths", "").await;
+    let (_, visible) = list(&h.read, "c-001", "paths", "").await;
     assert_eq!(visible["artifacts"].as_array().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn basic_auth_username_is_the_site_token() {
-    // wparse 的 http 连接器只有 `username` / `password`：Basic 的 username 就是站点 token。
-    let h = harness();
-    use base64::Engine as _;
-    let encoded = base64::engine::general_purpose::STANDARD.encode("tok_dev:");
-    let request = Request::builder()
-        .method("POST")
-        .uri("/internal/evidence")
-        .header("authorization", format!("Basic {encoded}"))
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&sink_record("cmd-basic-1", "ok")).unwrap(),
-        ))
-        .unwrap();
-    let response = h.sink.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let wrong = base64::engine::general_purpose::STANDARD.encode("tok_nope:");
-    let request = Request::builder()
-        .method("POST")
-        .uri("/internal/evidence")
-        .header("authorization", format!("Basic {wrong}"))
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&sink_record("cmd-basic-2", "ok")).unwrap(),
-        ))
-        .unwrap();
-    let response = h.sink.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn missing_token_is_401() {
-    let h = harness();
-    let request = Request::builder()
-        .method("POST")
-        .uri("/internal/evidence")
-        .header("content-type", "application/json")
-        .body(Body::from(json!([]).to_string()))
-        .unwrap();
-    let response = h.sink.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ── objects.kind = file：默认部署形态的端到端契约 ─────────────────────────────
@@ -498,7 +473,7 @@ async fn file_backend_stores_body_and_metadata_on_disk() {
     let dir = TempDirGuard::new("write");
     let h = file_harness(dir.path());
 
-    let (status, body) = post_record(&h.sink, TOKEN, sink_record("cmd-file-1", "warn")).await;
+    let (status, body) = post_record(&h.sink, record("cmd-file-1", "warn")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(h.object_count(), 1);
 
@@ -539,10 +514,10 @@ async fn file_backend_stores_body_and_metadata_on_disk() {
 async fn file_backend_replay_writes_one_object() {
     let dir = TempDirGuard::new("replay");
     let h = file_harness(dir.path());
-    let record = sink_record("cmd-file-2", "ok");
+    let record = record("cmd-file-2", "ok");
 
-    let (_, first) = post_record(&h.sink, TOKEN, record.clone()).await;
-    let (status, second) = post_record(&h.sink, TOKEN, record).await;
+    let (_, first) = post_record(&h.sink, record.clone()).await;
+    let (status, second) = post_record(&h.sink, record).await;
 
     assert_eq!(status, StatusCode::OK, "{second}");
     assert_eq!(second["duplicates"], 1);
@@ -558,8 +533,8 @@ async fn file_backend_supersede_keeps_the_old_object() {
     let dir = TempDirGuard::new("supersede");
     let h = file_harness(dir.path());
 
-    post_record(&h.sink, TOKEN, sink_record("cmd-file-3", "warn")).await;
-    let (status, _) = post_record(&h.sink, TOKEN, sink_record("cmd-file-3", "fail")).await;
+    post_record(&h.sink, record("cmd-file-3", "warn")).await;
+    let (status, _) = post_record(&h.sink, record("cmd-file-3", "fail")).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(h.index.len(), 1, "one dedupe key = one row");
@@ -570,7 +545,7 @@ async fn file_backend_supersede_keeps_the_old_object() {
 async fn file_backend_presign_returns_501() {
     let dir = TempDirGuard::new("presign");
     let h = file_harness(dir.path());
-    let (_, body) = post_record(&h.sink, TOKEN, sink_record("cmd-file-4", "ok")).await;
+    let (_, body) = post_record(&h.sink, record("cmd-file-4", "ok")).await;
     let artifact_id = body["artifacts"][0]["artifact_id"].as_str().unwrap();
 
     let (status, payload) = presign(&h.read, artifact_id, 60).await;
@@ -624,6 +599,10 @@ impl ObjectStore for FailingStore {
     ) -> Result<String, StoreError> {
         Err((self.error)())
     }
+
+    async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 fn failing_harness(error: fn() -> StoreError) -> Harness {
@@ -632,6 +611,7 @@ fn failing_harness(error: fn() -> StoreError) -> Harness {
         Arc::new(FailingStore { error }),
         None,
         None,
+        false,
     )
 }
 
@@ -639,7 +619,7 @@ fn failing_harness(error: fn() -> StoreError) -> Harness {
 async fn backend_failure_is_502_and_leaves_no_index_row() {
     let h = failing_harness(|| StoreError::Backend("disk full".to_string()));
 
-    let (status, body) = post_record(&h.sink, TOKEN, sink_record("cmd-fail-1", "ok")).await;
+    let (status, body) = post_record(&h.sink, record("cmd-fail-1", "ok")).await;
 
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body["error"]["code"], "evidence_write_failed");
@@ -657,7 +637,7 @@ async fn backend_failure_is_502_and_leaves_no_index_row() {
 async fn invalid_object_key_is_400_not_502() {
     let h = failing_harness(|| StoreError::InvalidKey("unsafe key".to_string()));
 
-    let (status, body) = post_record(&h.sink, TOKEN, sink_record("cmd-fail-2", "ok")).await;
+    let (status, body) = post_record(&h.sink, record("cmd-fail-2", "ok")).await;
 
     // 拼键错误是编程错误：重试不会变好，不能伪装成 5xx 让 sink 反复重投。
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -687,6 +667,10 @@ impl ObjectStore for PresignFailsStore {
             "sign /var/lib/wist-evidence/objects/secret: permission denied".to_string(),
         ))
     }
+
+    async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -696,8 +680,9 @@ async fn read_backend_failure_is_502_without_leaking_details() {
         Arc::new(PresignFailsStore),
         None,
         None,
+        false,
     );
-    let (status, body) = post_record(&h.sink, TOKEN, sink_record("cmd-leak-1", "ok")).await;
+    let (status, body) = post_record(&h.sink, record("cmd-leak-1", "ok")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let artifact_id = body["artifacts"][0]["artifact_id"].as_str().unwrap();
 
@@ -752,10 +737,10 @@ async fn get_content(
 async fn content_returns_the_original_body() {
     let dir = TempDirGuard::new("content");
     let h = file_harness(dir.path());
-    let (_, body) = post_record(&h.sink, TOKEN, sink_record("cmd-content-1", "warn")).await;
+    let (_, body) = post_record(&h.sink, record("cmd-content-1", "warn")).await;
     let artifact_id = body["artifacts"][0]["artifact_id"].as_str().unwrap();
 
-    let (status, content_type, bytes) = get_content(&h.read, "t-001", artifact_id).await;
+    let (status, content_type, bytes) = get_content(&h.read, "c-001", artifact_id).await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -773,11 +758,11 @@ async fn content_returns_the_original_body() {
 async fn content_respects_tenant_and_sensitivity() {
     let dir = TempDirGuard::new("content-visibility");
     let h = file_harness(dir.path());
-    let (_, body) = post_record(&h.sink, TOKEN, sink_record("cmd-content-2", "ok")).await;
+    let (_, body) = post_record(&h.sink, record("cmd-content-2", "ok")).await;
     let artifact_id = body["artifacts"][0]["artifact_id"].as_str().unwrap();
 
     // 跨租户：404，不泄露「存在但不能看」。
-    let (status, _, bytes) = get_content(&h.read, "t-002", artifact_id).await;
+    let (status, _, bytes) = get_content(&h.read, "c-002", artifact_id).await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
@@ -786,7 +771,7 @@ async fn content_respects_tenant_and_sensitivity() {
     );
 
     // 不存在：同样 404。
-    let (status, _, _) = get_content(&h.read, "t-001", "art_missing").await;
+    let (status, _, _) = get_content(&h.read, "c-001", "art_missing").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -794,14 +779,14 @@ async fn content_respects_tenant_and_sensitivity() {
 async fn content_of_a_vanished_object_is_502_not_404() {
     let dir = TempDirGuard::new("content-vanished");
     let h = file_harness(dir.path());
-    let (_, body) = post_record(&h.sink, TOKEN, sink_record("cmd-content-3", "ok")).await;
+    let (_, body) = post_record(&h.sink, record("cmd-content-3", "ok")).await;
     let artifact_id = body["artifacts"][0]["artifact_id"].as_str().unwrap();
 
     // 索引说有、对象被删掉：这是存储故障/待对账，答 404 会让人以为证据从未存在。
     let artifact = h.index.all().into_iter().next().unwrap();
     std::fs::remove_file(dir.path().join(&artifact.object_key)).expect("remove object");
 
-    let (status, _, bytes) = get_content(&h.read, "t-001", artifact_id).await;
+    let (status, _, bytes) = get_content(&h.read, "c-001", artifact_id).await;
     assert_eq!(
         status,
         StatusCode::BAD_GATEWAY,
@@ -814,4 +799,318 @@ async fn content_of_a_vanished_object_is_502_not_404() {
         !rendered.contains(dir.path().to_string_lossy().as_ref()),
         "{rendered}"
     );
+}
+
+// ── 写探针：每 5 分钟**打一次自己的写端点**，每天清掉过期的 ────────────────────
+
+use wist_evidence::probe::{ProbeRunner, ProbeTarget};
+
+fn probe_harness() -> Harness {
+    let memory = Arc::new(MemoryObjectStore::new());
+    harness_with(
+        Arc::new(MemoryIndex::new()),
+        memory.clone(),
+        Some(memory),
+        None,
+        true,
+    )
+}
+
+/// 把写端点真起来（探针要走 HTTP，不能直接调用例层）。
+async fn spawn_router(router: Router) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind probe target");
+    let address = listener.local_addr().expect("probe target addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    address
+}
+
+async fn probe_runner(h: &Harness) -> ProbeRunner {
+    let address = spawn_router(h.sink.clone()).await;
+    ProbeRunner::new(
+        h.service.clone(),
+        ProbeTarget {
+            url: format!("http://{address}/internal/evidence"),
+        },
+        wist_evidence::probe::PROBE_CUSTOMER,
+        std::time::Duration::from_secs(300),
+        std::time::Duration::from_secs(24 * 3600),
+    )
+}
+
+/// 打一个没人监听的端口：用来验「写端点不可达」也会被如实记录。
+async fn unreachable_probe_runner(h: &Harness) -> ProbeRunner {
+    // 先拿一个空闲端口再释放它，拿到的基本不会被别人抢走。
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral");
+    let address = probe.local_addr().expect("addr");
+    drop(probe);
+    ProbeRunner::new(
+        h.service.clone(),
+        ProbeTarget {
+            url: format!("http://{address}/internal/evidence"),
+        },
+        wist_evidence::probe::PROBE_CUSTOMER,
+        std::time::Duration::from_secs(300),
+        std::time::Duration::from_secs(24 * 3600),
+    )
+}
+
+async fn get_healthz(router: &Router) -> Value {
+    let request = Request::builder()
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+}
+
+#[tokio::test]
+async fn probe_writes_through_the_http_sink() {
+    let h = probe_harness();
+    let runner = probe_runner(&h).await;
+
+    runner.tick().await.expect("probe should be accepted");
+
+    // 真走了一遍 HTTP：路由、序列化、对象与索引都验了。
+    let row = h
+        .index
+        .all()
+        .into_iter()
+        .find(|row| row.subject_id == "_probe")
+        .expect("probe row");
+    assert_eq!(row.kind, Kind::InvestigationReport);
+    // 三字段形状没带敏感度 → 取部署默认（paths）。
+    assert_eq!(row.sensitivity.as_str(), "paths");
+    assert_eq!(row.customer_id, "c-probe");
+    assert_eq!(row.subject_type, "customer");
+    assert_eq!(h.object_count(), 1);
+
+    let status = h.service.probe_status().expect("probe status");
+    assert_eq!(status.last_ok, Some(true));
+    assert_eq!(status.consecutive_failures, 0);
+    assert!(status.last_at_ms.is_some());
+    assert!(status.last_latency_ms.is_some());
+}
+
+#[tokio::test]
+async fn probe_failure_is_recorded_without_breaking_anything() {
+    let h = probe_harness();
+    // 写端点不可达：探针必须把这次失败记下来而不是崩掉。
+    let runner = unreachable_probe_runner(&h).await;
+
+    let error = runner
+        .tick()
+        .await
+        .expect_err("unreachable endpoint must be a probe failure");
+    assert!(error.contains("unreachable"), "{error}");
+
+    let status = h.service.probe_status().expect("probe status");
+    assert_eq!(status.last_ok, Some(false));
+    assert_eq!(status.consecutive_failures, 1);
+    assert_eq!(h.index.len(), 0, "a rejected probe writes nothing");
+}
+
+#[tokio::test]
+async fn repeated_probes_accumulate_until_purged() {
+    let h = probe_harness();
+    let runner = probe_runner(&h).await;
+
+    for _ in 0..3 {
+        runner.tick().await.expect("probe");
+    }
+    // 每次都是新对象（真实的写入不会覆盖历史）—— 所以必须有每日清理。
+    assert_eq!(h.index.len(), 3);
+    assert_eq!(h.object_count(), 3);
+
+    // 保留 1 小时：还新鲜，一条都不删。
+    let purged = h
+        .service
+        .purge_probes(
+            wist_evidence::probe::PROBE_CUSTOMER,
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .expect("purge");
+    assert_eq!(purged, 0);
+    assert_eq!(h.index.len(), 3);
+
+    // 保留 0：刚写的也算过期 → 全清（对象一起没）。
+    let purged = h
+        .service
+        .purge_probes(
+            wist_evidence::probe::PROBE_CUSTOMER,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("purge");
+    assert_eq!(purged, 3);
+    assert_eq!(h.index.len(), 0);
+    assert_eq!(h.object_count(), 0);
+}
+
+#[tokio::test]
+async fn purge_only_touches_probes() {
+    let h = probe_harness();
+    let runner = probe_runner(&h).await;
+
+    post_record(&h.sink, record("cmd-real-1", "warn")).await;
+    runner.tick().await.expect("probe");
+
+    let purged = h
+        .service
+        .purge_probes(
+            wist_evidence::probe::PROBE_CUSTOMER,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("purge");
+
+    assert_eq!(purged, 1, "only the probe may be purged");
+    assert_eq!(h.index.len(), 1);
+    assert_eq!(
+        h.index
+            .all()
+            .into_iter()
+            .next()
+            .unwrap()
+            .command_id
+            .as_deref(),
+        Some("cmd-real-1"),
+        "real evidence must survive the probe purge"
+    );
+}
+
+#[tokio::test]
+async fn probe_artifacts_are_hidden_from_the_list() {
+    let h = probe_harness();
+    let runner = probe_runner(&h).await;
+
+    post_record(&h.sink, record("cmd-list-1", "ok")).await;
+    runner.tick().await.expect("probe");
+
+    let (status, body) = list(&h.read, "c-001", "commandlines", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let artifacts = body["artifacts"].as_array().expect("artifacts");
+    // 探针每 5 分钟一条，不能污染人的列表。
+    assert_eq!(artifacts.len(), 1, "{body}");
+    assert_eq!(artifacts[0]["command_id"], "cmd-list-1");
+}
+
+#[tokio::test]
+async fn healthz_exposes_probe_status() {
+    let h = probe_harness();
+    let runner = probe_runner(&h).await;
+    runner.tick().await.expect("probe");
+
+    // 两张监听都要能看到（compose 与 console 各打一张）。
+    for router in [&h.sink, &h.read] {
+        let body = get_healthz(router).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["probe"]["last_ok"], true, "{body}");
+        assert!(body["probe"]["last_at_ms"].is_u64(), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn healthz_has_no_probe_block_when_disabled() {
+    let h = harness();
+    let body = get_healthz(&h.sink).await;
+    assert_eq!(body["status"], "ok");
+    assert!(body.get("probe").is_none(), "{body}");
+}
+
+// ── 三字段形状：cust_id / cmd_id / content ──────────────────────────────────
+// ── 三字段形状：cust_id / cmd_id / content ──────────────
+
+fn simple_record(cust_id: &str, cmd_id: &str) -> Value {
+    json!({
+        "cust_id": cust_id,
+        "cmd_id": cmd_id,
+        "content": { "summary": { "overall": "warn" }, "detail": "任意证据内容" },
+    })
+}
+
+#[tokio::test]
+async fn simple_record_is_stored_with_deployment_defaults() {
+    let h = harness();
+
+    let (status, body) = post_record(&h.sink, simple_record("c-002", "cmd-simple-1")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 1);
+
+    let row = h.index.all().into_iter().next().expect("row");
+    // 三字段之外的维度取部署默认值；客户与主体都来自 `cust_id`。
+    // 租户就是客户：两个字段是同一个值。
+    assert_eq!(row.tenant_id, "c-002");
+    assert_eq!(row.customer_id, "c-002");
+    assert_eq!(row.subject_id, "c-002");
+    assert_eq!(row.subject_type, "customer");
+    assert_eq!(row.command_id.as_deref(), Some("cmd-simple-1"));
+    assert_eq!(row.kind, Kind::InvestigationReport);
+    assert_eq!(row.schema_id, "wist.evidence/v1");
+    assert_eq!(row.sensitivity.as_str(), "paths");
+    assert_eq!(row.verdict.as_str(), "unknown");
+    // 内容原样落库（对象里能读回同样的 JSON）。
+    let stored = h.stored_body(&row.object_key).expect("object stored");
+    let parsed: Value = serde_json::from_slice(&stored).expect("json");
+    assert_eq!(parsed["detail"], "任意证据内容");
+}
+
+#[tokio::test]
+async fn simple_record_accepts_a_text_content() {
+    let h = harness();
+    let record = json!({
+        "cust_id": "c-002",
+        "cmd_id": "cmd-simple-2",
+        "content": "raw log line 1\nraw log line 2",
+    });
+
+    let (status, body) = post_record(&h.sink, record).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let row = h.index.all().into_iter().next().expect("row");
+    let stored = h.stored_body(&row.object_key).expect("object stored");
+    assert_eq!(
+        String::from_utf8(stored).unwrap(),
+        "raw log line 1\nraw log line 2"
+    );
+}
+
+#[tokio::test]
+async fn simple_record_is_idempotent_on_cust_and_cmd() {
+    let h = harness();
+    let record = simple_record("c-002", "cmd-simple-3");
+
+    post_record(&h.sink, record.clone()).await;
+    let (status, body) = post_record(&h.sink, record).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["duplicates"], 1, "{body}");
+    assert_eq!(h.index.len(), 1);
+    assert_eq!(h.object_count(), 1);
+}
+
+#[tokio::test]
+async fn array_body_writes_every_record() {
+    let h = harness();
+    let batch = json!([
+        simple_record("c-002", "cmd-batch-1"),
+        simple_record("c-002", "cmd-batch-2"),
+        simple_record("c-003", "cmd-batch-3"),
+    ]);
+
+    let (status, body) = post_record(&h.sink, batch).await;
+
+    // `batch_size > 1` 是数据面的常态，不能只收单对象。
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 3);
+    assert_eq!(body["duplicates"], 0);
+    assert_eq!(h.index.len(), 3);
+    assert_eq!(h.object_count(), 3);
 }

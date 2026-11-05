@@ -67,6 +67,9 @@ pub trait Index: Send + Sync {
 
     /// 同键新内容：更新当前行指向新对象，`artifact_id` 不变（它代表"这次动作的产物"）。
     async fn update(&self, artifact: &Artifact) -> Result<(), IndexError>;
+
+    /// 删除一行（对账 / 探针清理用）。**不存在视为成功**，且必须限在同一个租户内。
+    async fn delete(&self, tenant_id: &str, artifact_id: &str) -> Result<(), IndexError>;
 }
 
 /// 进程内索引：测试与本地联调用。
@@ -190,6 +193,17 @@ impl Index for MemoryIndex {
                 artifact.artifact_id
             ))),
         }
+    }
+
+    async fn delete(&self, tenant_id: &str, artifact_id: &str) -> Result<(), IndexError> {
+        let mut rows = self.rows.write().expect("memory index poisoned");
+        if rows
+            .get(artifact_id)
+            .is_some_and(|row| row.tenant_id == tenant_id)
+        {
+            rows.remove(artifact_id);
+        }
+        Ok(())
     }
 }
 
@@ -473,6 +487,16 @@ mod pg {
                     artifact.artifact_id
                 )));
             }
+            Ok(())
+        }
+
+        async fn delete(&self, tenant_id: &str, artifact_id: &str) -> Result<(), IndexError> {
+            sqlx::query("delete from evidence_artifact where tenant_id = $1 and artifact_id = $2")
+                .bind(tenant_id)
+                .bind(artifact_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|err| IndexError::Backend(format!("delete artifact: {err}")))?;
             Ok(())
         }
     }

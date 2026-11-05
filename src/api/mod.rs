@@ -1,6 +1,6 @@
 //! HTTP 面：两张监听、两套信任模型。
 //!
-//! - 写（[`sink`]）：数据面 `http_sink` 直投，明文 + 站点 token；
+//! - 写（[`sink`]）：数据面 `http_sink` 直投，明文（内网可信；mTLS 在 P1）；
 //! - 读（[`read`]）：内部服务调用，mTLS + scope（P0 由内网 TLS 终结层往请求头注入身份，
 //!   CA-I 落地后改成证书 claim，见设计稿 §19-10）。
 //!
@@ -13,17 +13,21 @@ pub mod sink;
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
+use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
 
-use crate::service::{EvidenceService, TokenMap};
+use crate::domain::{Kind, Sensitivity};
+use crate::service::EvidenceService;
 
-/// 写端点的状态：需要 token 表 + 服务。
+/// 写端点的状态：服务 + 三字段形状要用的部署默认值。
 #[derive(Clone)]
 pub struct SinkState {
     pub service: Arc<EvidenceService>,
-    pub tokens: Arc<TokenMap>,
+    pub default_kind: Kind,
+    pub default_schema: String,
+    pub default_sensitivity: Sensitivity,
 }
 
 /// 读端点的状态：只需要服务（身份来自请求头 / 将来的证书）。
@@ -34,7 +38,7 @@ pub struct ReadState {
 
 pub fn sink_router(state: SinkState, max_body_bytes: usize) -> Router {
     Router::new()
-        .route("/healthz", get(healthz))
+        .route("/healthz", get(sink_healthz))
         .route("/internal/evidence", post(sink::write_records))
         // 上限比正文上限宽一点：外层记录把正文当字符串放，转义会膨胀（与网关 ingest 同口径）。
         .layer(DefaultBodyLimit::max(
@@ -45,7 +49,7 @@ pub fn sink_router(state: SinkState, max_body_bytes: usize) -> Router {
 
 pub fn read_router(state: ReadState) -> Router {
     Router::new()
-        .route("/healthz", get(healthz))
+        .route("/healthz", get(read_healthz))
         .route("/internal/evidence", get(read::list_evidence))
         .route(
             "/internal/evidence/{artifact_id}",
@@ -59,6 +63,20 @@ pub fn read_router(state: ReadState) -> Router {
         .with_state(state)
 }
 
-async fn healthz() -> Json<serde_json::Value> {
-    Json(json!({ "status": "ok" }))
+async fn sink_healthz(State(state): State<SinkState>) -> Json<serde_json::Value> {
+    Json(health_body(&state.service))
+}
+
+async fn read_healthz(State(state): State<ReadState>) -> Json<serde_json::Value> {
+    Json(health_body(&state.service))
+}
+
+/// 两张监听共用：进程活着就是 `status = ok`；开了写探针时多一个 `probe` 块，
+/// 让上游能区分「端口能连上」与「真的能写进去」。
+fn health_body(service: &EvidenceService) -> serde_json::Value {
+    let mut body = json!({ "status": "ok" });
+    if let Some(probe) = service.probe_status() {
+        body["probe"] = serde_json::to_value(probe).unwrap_or(serde_json::Value::Null);
+    }
+    body
 }

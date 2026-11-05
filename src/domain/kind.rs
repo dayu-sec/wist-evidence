@@ -8,8 +8,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::artifact::Durability;
-
 /// 一份产物是什么。与设计稿 §4.1 的清单一一对应。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,18 +56,6 @@ impl Kind {
             "derived" => Self::Derived,
             _ => return None,
         })
-    }
-
-    /// 数据面帧标记 → `kind`。
-    ///
-    /// wparse 的 OML 把帧标记原样带出来（`IVSREP` / `OBSFACT` / …），只有**属于证据**的
-    /// 那一个才映射；其余帧不该打到这个端点（`None` → 400，而不是猜一个 kind）。
-    pub fn from_frame_marker(marker: &str) -> Option<Self> {
-        let marker = marker.trim().trim_end_matches(':').to_ascii_uppercase();
-        match marker.as_str() {
-            "IVSREP" => Some(Self::InvestigationReport),
-            _ => None,
-        }
     }
 
     /// 对象键里的扩展名段（正文是什么形态）。
@@ -223,32 +209,9 @@ impl RetentionClass {
     }
 }
 
-/// 写入方对「有没有兜底副本」的声明（§10.2）。
-pub fn durability_from_str(value: &str) -> Durability {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "confirmed" => Durability::Confirmed,
-        _ => Durability::BestEffort,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn frame_marker_maps_only_evidence_frames() {
-        assert_eq!(
-            Kind::from_frame_marker("IVSREP"),
-            Some(Kind::InvestigationReport)
-        );
-        assert_eq!(
-            Kind::from_frame_marker("IVSREP:"),
-            Some(Kind::InvestigationReport)
-        );
-        // 非证据帧不能被猜成某个 kind。
-        assert_eq!(Kind::from_frame_marker("OBSFACT"), None);
-        assert_eq!(Kind::from_frame_marker(""), None);
-    }
 
     #[test]
     fn sensitivity_order_matches_the_authorization_contract() {

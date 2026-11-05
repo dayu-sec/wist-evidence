@@ -1,20 +1,19 @@
 //! 写与读的用例层：所有"该不该写 / 该不该给"的判断都在这里，HTTP 层只做搬运。
 //!
 //! 与设计稿的对应关系：
-//! - §6.2 顺序与幂等 —— [`EvidenceService::write`]
+//! - §6.2 顺序与幂等 —— [`EvidenceService::write_simple`]
 //! - §7.2 授权模型 —— [`EvidenceService::metadata`] / [`EvidenceService::presign`]
 //! - §5.2 对象元数据 —— 写入时一次性带齐七个自描述字段
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::domain::Artifact;
 use crate::domain::artifact::{Durability, new_artifact_id, object_key};
-use crate::domain::kind::{Kind, RetentionClass, Sensitivity, Verdict, durability_from_str};
+use crate::domain::kind::{Kind, RetentionClass, Sensitivity, Verdict};
 use crate::infra::{Index, IndexError, ListFilter, ObjectMeta, ObjectStore, StoreError};
 
 /// 短签名有效期上限（D8）：预签名 URL 是 bearer token，必须短命 + 单对象。
@@ -23,44 +22,23 @@ pub const MAX_PRESIGN_TTL: Duration = Duration::from_secs(60);
 /// 一次列表最多返回多少行（避免把浏览器/索引拖死）。
 pub const MAX_LIST_LIMIT: usize = 200;
 
-/// sink 调用方身份。来自 `Authorization` token → 服务端映射，**不是**请求体自述。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SinkCaller {
-    pub tenant_id: String,
-    pub customer_id: String,
-}
+/// 写探针的保留标记：探针产物的 `subject_id` 固定是这个值，每日清理按它筛。
+pub const PROBE_SUBJECT: &str = "_probe";
 
-/// wparse `http_sink` 投递的一条记录。
-///
-/// 形状与网关 `api/ingest.rs` 收到的记录同源：信封字段 + `body`（契约对象的 JSON 文本）。
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SinkRecord {
-    /// 帧标记（`IVSREP` / …）。只有证据帧的标记才映射到 `kind`。
-    #[serde(default)]
-    pub schema: String,
-    /// 信封里的 agent（归属依据之一，**与正文自述交叉核对**）。
-    #[serde(default)]
-    pub agent: String,
-    /// 可选：站点 / 网关标识（由数据面配置注入）。
-    #[serde(default)]
-    pub gateway: Option<String>,
-    /// 观测时间（RFC3339）；缺省取服务端收到的时间。
-    #[serde(default)]
-    pub ts: Option<String>,
-    /// 帧序号。P0 不参与判重（判重靠 `command_id`）。
-    #[serde(default)]
-    pub seq: Option<u64>,
-    /// 敏感度档；缺省按 `paths`（与体检报告同档，保守）。
-    #[serde(default)]
-    pub sensitivity: Option<String>,
-    /// `best_effort` / `confirmed`；缺省 `best_effort`。
-    #[serde(default)]
-    pub durability: Option<String>,
-    /// 写入方自报的 sha256（可选）。与计算结果不一致 → `evidence_integrity_failed`。
-    #[serde(default)]
-    pub sha256: Option<String>,
-    /// 契约对象原样 JSON 文本（与 `IVSREP` 帧 body 一致）。
-    pub body: String,
+/// 写探针的现状：给 `/healthz` 看，也让星象台的「接口可用性」页能区分
+/// 「端口通」与「真的写了一笔」。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ProbeStatus {
+    /// 上一次探针是否成功；服务刚起、还没探过时是 `null`。
+    pub last_ok: Option<bool>,
+    /// 上一次探针时间（UTC，RFC3339 / 毫秒时间戳两种都给：前者给人看，后者给前端算年龄）。
+    pub last_at: Option<DateTime<Utc>>,
+    pub last_at_ms: Option<u64>,
+    pub last_latency_ms: Option<u64>,
+    /// 连续失败次数（成功即归零）。
+    pub consecutive_failures: u32,
+    /// 累计清除了多少条过期探针。
+    pub purged_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,12 +57,8 @@ pub enum WriteError {
     BadRequest(&'static str),
     /// `kind` 在词表里，但本次部署不允许（403）。
     KindNotAllowed(&'static str),
-    /// 身份与内容不一致（403）。
-    Forbidden(&'static str),
     /// 正文超过上限（413）。
     TooLarge,
-    /// 自报 sha256 与计算结果不一致（422）。
-    IntegrityFailed,
     /// 后端失败（5xx）。
     Backend(String),
 }
@@ -140,6 +114,46 @@ pub struct EvidenceService {
     bucket: String,
     allowed_kinds: Vec<Kind>,
     max_body_bytes: usize,
+    /// `Some` = 写探针已启用（由启动流程调 `enable_probe`）；`None` = 没开。
+    probe: Option<Arc<RwLock<ProbeStatus>>>,
+}
+
+/// **三字段形状**的写入请求：`cust_id` / `cmd_id` / `content`（`subject` 可选）。
+///
+/// `kind` / `schema_id` / `sensitivity` 由调用层（HTTP 层）按部署配置填好 ——
+/// 数据面只负责说清「谁的、哪次动作、产物是什么」。
+#[derive(Debug, Clone)]
+pub struct SimpleWrite {
+    pub customer_id: String,
+    pub command_id: String,
+    /// 主体标识：默认就是 `cust_id`，探针用保留值 `_probe`。
+    pub subject_id: String,
+    pub subject_type: &'static str,
+    pub kind: Kind,
+    pub schema_id: String,
+    pub sensitivity: Sensitivity,
+    /// 证据正文（原样字节的 UTF-8 文本）。
+    pub content: String,
+}
+
+/// 归一化后的写请求：校验与提交都只看这一份。
+struct PreparedWrite {
+    /// 客户就是租户：它同时是对象键第一段和索引分区键。
+    customer_id: String,
+    command_id: Option<String>,
+    subject_id: String,
+    subject_type: &'static str,
+    kind: Kind,
+    subtype: Option<String>,
+    schema_id: String,
+    sensitivity: Sensitivity,
+    verdict: Verdict,
+    marker_ids: Vec<String>,
+    source_ref: Option<String>,
+    content: String,
+    durability: Durability,
+    gateway_id: Option<String>,
+    reported_at: DateTime<Utc>,
 }
 
 impl EvidenceService {
@@ -156,71 +170,72 @@ impl EvidenceService {
             bucket,
             allowed_kinds,
             max_body_bytes,
+            probe: None,
         }
     }
 
-    /// 单条记录写入。批量由 HTTP 层逐条调用 —— 每条都要能独立成败。
-    pub async fn write(
-        &self,
-        caller: &SinkCaller,
-        record: SinkRecord,
-    ) -> Result<WriteOutcome, WriteError> {
-        let kind = Kind::from_frame_marker(&record.schema)
-            .ok_or(WriteError::BadRequest("evidence_frame_not_evidence"))?;
-        if !self.allowed_kinds.contains(&kind) {
-            return Err(WriteError::KindNotAllowed(kind.as_str()));
-        }
+    /// 打开写探针的状态位。幂等；没打开的部署 `/healthz` 不会报 probe 块。
+    pub fn enable_probe(&mut self) {
+        self.probe = Some(Arc::new(RwLock::new(ProbeStatus::default())));
+    }
 
-        if record.body.len() > self.max_body_bytes {
+    /// 读探针现状；没启用时返回 `None`。
+    pub fn probe_status(&self) -> Option<ProbeStatus> {
+        self.probe
+            .as_ref()
+            .map(|probe| probe.read().expect("probe status poisoned").clone())
+    }
+
+    /// **三字段写入**：`cust_id` / `cmd_id` / `content`（其余维度由调用层按部署配置填好）。
+    ///
+    /// 数据面只需要说清三件事：谁的、哪次动作、产物是什么。`kind` / `schema_id` /
+    /// `sensitivity` 这些"我们自己的口径"不该让每个接入方都学一遍。
+    pub async fn write_simple(&self, request: SimpleWrite) -> Result<WriteOutcome, WriteError> {
+        if !self.allowed_kinds.contains(&request.kind) {
+            return Err(WriteError::KindNotAllowed(request.kind.as_str()));
+        }
+        let prepared = PreparedWrite {
+            customer_id: request.customer_id,
+            command_id: Some(request.command_id),
+            subject_id: request.subject_id,
+            subject_type: request.subject_type,
+            kind: request.kind,
+            subtype: None,
+            schema_id: request.schema_id,
+            sensitivity: request.sensitivity,
+            verdict: Verdict::Unknown,
+            marker_ids: Vec::new(),
+            source_ref: None,
+            content: request.content,
+            durability: Durability::BestEffort,
+            gateway_id: None,
+            reported_at: Utc::now(),
+        };
+        self.commit(prepared).await
+    }
+
+    /// 提交路径：校验 → 去重 → 对象 → 索引。
+    async fn commit(&self, w: PreparedWrite) -> Result<WriteOutcome, WriteError> {
+        if w.content.len() > self.max_body_bytes {
             return Err(WriteError::TooLarge);
         }
-
-        let body = ReportBody::parse(&record.body)?;
-
-        // 身份先于内容：subject 只从信封来，且必须是安全段（服务端拼键）。
-        let subject_id = record.agent.trim();
-        if !crate::domain::artifact::is_safe_segment(subject_id) {
+        if !crate::domain::artifact::is_safe_segment(&w.subject_id) {
             return Err(WriteError::BadRequest("evidence_subject_invalid"));
         }
-
-        // 正文里的 tenant_id 只用于交叉核对，永不采信（D7）。
-        if let Some(claimed) = body.tenant_id.as_deref()
-            && claimed != caller.tenant_id
-        {
-            return Err(WriteError::Forbidden("evidence_tenant_mismatch"));
+        // 客户就是租户：它既是对象键的第一段，也是索引分区键。
+        if !crate::domain::artifact::is_safe_segment(&w.customer_id) {
+            return Err(WriteError::BadRequest("evidence_customer_invalid"));
         }
 
-        let sensitivity = match record.sensitivity.as_deref() {
-            Some(raw) => Sensitivity::parse(raw)
-                .ok_or(WriteError::BadRequest("evidence_sensitivity_unknown"))?,
-            None => Sensitivity::Paths,
-        };
-        let retention_class = RetentionClass::resolve(kind, sensitivity)
+        let retention_class = RetentionClass::resolve(w.kind, w.sensitivity)
             .ok_or(WriteError::BadRequest("evidence_retention_undefined"))?;
 
-        let sha256 = sha256_hex(record.body.as_bytes());
-        if let Some(claimed) = record.sha256.as_deref()
-            && !claimed.eq_ignore_ascii_case(&sha256)
-        {
-            log::warn!(
-                "evidence_integrity_failed tenant={} agent={subject_id} claimed={claimed} computed={sha256}",
-                caller.tenant_id
-            );
-            return Err(WriteError::IntegrityFailed);
-        }
+        let sha256 = sha256_hex(w.content.as_bytes());
 
-        let reported_at = record
-            .ts
-            .as_deref()
-            .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-            .map(|ts| ts.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
-
-        let dedupe_key = body.command_id.clone();
-        let existing = match dedupe_key.as_deref() {
+        let existing = match w.command_id.as_deref() {
             Some(key) => self
                 .index
-                .find_by_dedupe(&caller.tenant_id, kind, subject_id, key)
+                .find_by_dedupe(&w.customer_id, w.kind, &w.subject_id, key)
                 .await
                 .map_err(index_error)?,
             None => None,
@@ -231,8 +246,8 @@ impl EvidenceService {
             && existing.sha256 == sha256
         {
             log::debug!(
-                "evidence_write_duplicate tenant={} artifact={}",
-                caller.tenant_id,
+                "evidence_write_duplicate customer={} artifact={}",
+                w.customer_id,
                 existing.artifact_id
             );
             return Ok(WriteOutcome {
@@ -245,26 +260,20 @@ impl EvidenceService {
 
         // 对象键每次都换新的不透明 id：键不可覆盖（§5.2），否则"旧对象"就没了。
         let object_id = new_artifact_id();
-        let key = object_key(&caller.tenant_id, kind, &object_id, reported_at)
+        let key = object_key(&w.customer_id, w.kind, &object_id, w.reported_at)
             .map_err(|_| WriteError::BadRequest("evidence_object_key_invalid"))?;
 
-        let compressed = zstd::encode_all(record.body.as_bytes(), 3)
+        let compressed = zstd::encode_all(w.content.as_bytes(), 3)
             .map_err(|err| WriteError::Backend(format!("compress body: {err}")))?;
 
-        let durability = record
-            .durability
-            .as_deref()
-            .map(durability_from_str)
-            .unwrap_or(Durability::BestEffort);
-
         let meta = object_meta(
-            &caller.tenant_id,
-            kind,
-            subject_id,
-            &body.schema_id,
-            sensitivity,
+            &w.customer_id,
+            w.kind,
+            &w.subject_id,
+            &w.schema_id,
+            w.sensitivity,
             &sha256,
-            body.command_id.as_deref(),
+            w.command_id.as_deref(),
         );
 
         // D6：先对象、后索引。对象写成功但索引失败，只会留下可对账补回的孤儿对象。
@@ -280,29 +289,29 @@ impl EvidenceService {
             .unwrap_or_else(new_artifact_id);
         let artifact = Artifact {
             artifact_id: artifact_id.clone(),
-            tenant_id: caller.tenant_id.clone(),
-            customer_id: caller.customer_id.clone(),
-            kind,
-            subtype: body.topic.clone(),
-            subject_type: "agent".to_string(),
-            subject_id: subject_id.to_string(),
-            gateway_id: record.gateway.clone(),
-            agent_id: Some(subject_id.to_string()),
-            command_id: body.command_id.clone(),
-            dedupe_key: dedupe_key.clone().unwrap_or_else(|| artifact_id.clone()),
-            schema_id: body.schema_id.clone(),
-            sensitivity,
+            tenant_id: w.customer_id.clone(),
+            customer_id: w.customer_id.clone(),
+            kind: w.kind,
+            subtype: w.subtype.clone(),
+            subject_type: w.subject_type.to_string(),
+            subject_id: w.subject_id.clone(),
+            gateway_id: w.gateway_id.clone(),
+            agent_id: Some(w.subject_id.clone()),
+            command_id: w.command_id.clone(),
+            dedupe_key: w.command_id.clone().unwrap_or_else(|| artifact_id.clone()),
+            schema_id: w.schema_id.clone(),
+            sensitivity: w.sensitivity,
             retention_class,
             bucket: self.bucket.clone(),
             object_key: key,
-            size_bytes: record.body.len() as i64,
+            size_bytes: w.content.len() as i64,
             sha256,
-            verdict: body.verdict,
-            marker_ids: body.marker_ids,
-            source_ref: body.source_ref.clone(),
+            verdict: w.verdict,
+            marker_ids: w.marker_ids.clone(),
+            source_ref: w.source_ref.clone(),
             source_sha256: None,
-            durability,
-            reported_at,
+            durability: w.durability,
+            reported_at: w.reported_at,
             stored_at: now,
             retention_until: now + chrono::Duration::days(retention_class.days()),
             legal_hold: false,
@@ -318,10 +327,10 @@ impl EvidenceService {
                 Ok(()) => false,
                 Err(IndexError::Conflict) => {
                     // 并发重投：重新读一次，按拿到的那行决定是重投还是替换。
-                    let again = match dedupe_key.as_deref() {
+                    let again = match w.command_id.as_deref() {
                         Some(key) => self
                             .index
-                            .find_by_dedupe(&caller.tenant_id, kind, subject_id, key)
+                            .find_by_dedupe(&w.customer_id, w.kind, &w.subject_id, key)
                             .await
                             .map_err(index_error)?,
                         None => None,
@@ -350,7 +359,7 @@ impl EvidenceService {
 
         Ok(WriteOutcome {
             artifact_id,
-            durability,
+            durability: w.durability,
             duplicate: false,
             superseded,
         })
@@ -394,6 +403,10 @@ impl EvidenceService {
 
         let mut artifacts = Vec::with_capacity(rows.len());
         for row in rows.iter().take(limit) {
+            // 写探针是自检产物，不该混进人的证据列表（按 id 仍可读）。
+            if row.subject_id == PROBE_SUBJECT {
+                continue;
+            }
             if principal.has_scope(row.kind)
                 && principal.max_sensitivity >= row.sensitivity
                 && row.state == crate::domain::ArtifactState::Stored
@@ -483,6 +496,75 @@ impl EvidenceService {
         })
     }
 
+    /// 记录一次探针结果（由 [`crate::probe::ProbeRunner`] 在真正打完写端点后调用）。
+    pub(crate) fn record_probe_result(&self, ok: bool, latency_ms: u64) {
+        let Some(probe) = &self.probe else {
+            return;
+        };
+        let now = Utc::now();
+        let mut status = probe.write().expect("probe status poisoned");
+        status.last_at = Some(now);
+        status.last_at_ms = Some(now.timestamp_millis().max(0) as u64);
+        status.last_latency_ms = Some(latency_ms);
+        if ok {
+            status.last_ok = Some(true);
+            status.consecutive_failures = 0;
+        } else {
+            status.last_ok = Some(false);
+            status.consecutive_failures = status.consecutive_failures.saturating_add(1);
+        }
+    }
+
+    /// 清掉超过保留期的探针产物（对象 + 索引行），返回清除条数。
+    /// 只动 `subject_id = _probe` 的行，不碰真证据。
+    pub async fn purge_probes(
+        &self,
+        tenant_id: &str,
+        retention: Duration,
+    ) -> Result<u64, ReadError> {
+        let cutoff = Utc::now() - chrono::Duration::from_std(retention).unwrap_or_default();
+        let filter = ListFilter {
+            kind: None,
+            subject_id: Some(PROBE_SUBJECT.to_string()),
+            since: None,
+        };
+        let mut purged = 0u64;
+        loop {
+            let rows = self
+                .index
+                .list(tenant_id, &filter, MAX_LIST_LIMIT, None)
+                .await
+                .map_err(|err| ReadError::Backend(err.to_string()))?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut deleted = 0u64;
+            for row in &rows {
+                if row.reported_at >= cutoff {
+                    continue;
+                }
+                // 先对象、后行：对象删失败就留着行，下次还能重试；反过来会留孤儿对象。
+                self.objects
+                    .delete(&row.object_key)
+                    .await
+                    .map_err(|err| ReadError::Backend(err.to_string()))?;
+                self.index
+                    .delete(tenant_id, &row.artifact_id)
+                    .await
+                    .map_err(|err| ReadError::Backend(err.to_string()))?;
+                deleted += 1;
+            }
+            purged += deleted;
+            if deleted == 0 || rows.len() < MAX_LIST_LIMIT {
+                break;
+            }
+        }
+        if let Some(probe) = &self.probe {
+            probe.write().expect("probe status poisoned").purged_total += purged;
+        }
+        Ok(purged)
+    }
+
     async fn find_visible(
         &self,
         principal: &ReadPrincipal,
@@ -541,85 +623,6 @@ fn object_meta(
     meta
 }
 
-/// `IVSREP` 正文里我们**只读闭集字段**；自由文本一律不解析、不入索引。
-#[derive(Debug, Default, Deserialize)]
-struct ReportBody {
-    #[serde(default)]
-    command_id: Option<String>,
-    #[serde(default)]
-    report_schema: Option<String>,
-    #[serde(default)]
-    topic: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(default)]
-    source_ref: Option<String>,
-    #[serde(default)]
-    summary: Option<SummaryBody>,
-    #[serde(default)]
-    findings: Vec<FindingBody>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SummaryBody {
-    #[serde(default)]
-    overall: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FindingBody {
-    #[serde(default)]
-    id: Option<String>,
-}
-
-impl ReportBody {
-    fn parse(raw: &str) -> Result<ParsedBody, WriteError> {
-        let body: ReportBody = serde_json::from_str(raw)
-            .map_err(|_| WriteError::BadRequest("evidence_body_invalid"))?;
-        let schema_id = body
-            .report_schema
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(WriteError::BadRequest("evidence_schema_missing"))?;
-        // marker_ids 只收闭集标识（finding.id），去重保序，不携带值。
-        let mut marker_ids: Vec<String> = Vec::new();
-        for finding in &body.findings {
-            if let Some(id) = finding.id.as_deref().map(str::trim)
-                && !id.is_empty()
-                && !marker_ids.iter().any(|existing| existing == id)
-            {
-                marker_ids.push(id.to_string());
-            }
-        }
-        let verdict = body
-            .summary
-            .as_ref()
-            .and_then(|summary| summary.overall.as_deref())
-            .map(Verdict::parse)
-            .unwrap_or(Verdict::Unknown);
-        Ok(ParsedBody {
-            command_id: body.command_id,
-            schema_id,
-            topic: body.topic,
-            tenant_id: body.tenant_id,
-            source_ref: body.source_ref,
-            verdict,
-            marker_ids,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct ParsedBody {
-    command_id: Option<String>,
-    schema_id: String,
-    topic: Option<String>,
-    tenant_id: Option<String>,
-    source_ref: Option<String>,
-    verdict: Verdict,
-    marker_ids: Vec<String>,
-}
-
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -647,6 +650,3 @@ fn store_error(err: StoreError) -> WriteError {
         StoreError::Backend(message) => WriteError::Backend(message),
     }
 }
-
-/// 配置里的 `[sink.tokens]`：`token = { tenant_id, customer_id }`。
-pub type TokenMap = BTreeMap<String, SinkCaller>;

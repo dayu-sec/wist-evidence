@@ -10,11 +10,13 @@ max_body_bytes = 4194304
 # P0 只开调查报告；`diagnose_report` 等加进这个列表即可（枚举已就绪）。
 allowed_kinds = ["investigation_report"]
 
-# 站点 token → 租户。**每站点一个**，服务端映射 tenant_id / customer_id。
-# 生产：token 从 `${SEC_EVIDENCE_SINK_TOKENS_<SITE>}` 来，不写在仓库里。
-[sink.tokens.tok_dev]
-tenant_id = "t-001"
-customer_id = "c-001"
+# 三字段形状（`cust_id` / `cmd_id` / `content`）的默认口径。
+# 租户就是客户：`cust_id` 直接当分区键（对象键第一段 + 索引租户列）。
+default_kind = "investigation_report"
+default_schema = "wist.evidence/v1"
+default_sensitivity = "paths"
+
+# 认证：写入端点不校验（内网可信）；P1 换成 HTTPS 双向认证。
 
 # ── 读面：内部服务（mTLS + scope；P0 由 TLS 终结层注入身份头）────────────────
 [read]
