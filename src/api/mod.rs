@@ -73,8 +73,14 @@ async fn read_healthz(State(state): State<ReadState>) -> Json<serde_json::Value>
 
 /// 两张监听共用：进程活着就是 `status = ok`；开了写探针时多一个 `probe` 块，
 /// 让上游能区分「端口能连上」与「真的能写进去」。
+///
+/// `objects.kind` 是**部署自述**：读端据此判断正文怎么打开（`s3` = 签名 URL，
+/// `file` = 只能代理读），不必先发一个必然 501 的 `:presign`。
 fn health_body(service: &EvidenceService) -> serde_json::Value {
-    let mut body = json!({ "status": "ok" });
+    let mut body = json!({
+        "status": "ok",
+        "objects": { "kind": service.objects_backend().as_str() },
+    });
     if let Some(probe) = service.probe_status() {
         body["probe"] = serde_json::to_value(probe).unwrap_or(serde_json::Value::Null);
     }

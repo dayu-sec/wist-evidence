@@ -22,6 +22,28 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+/// 对象后端类型：**只**用于对外自述（`/healthz` 的 `objects.kind`），不参与读写逻辑。
+///
+/// 为什么要自述：`file` 后端没有预签名 URL，上游（console BFF / 页面）先要签名
+/// 就必然吃一次 `evidence_presign_unsupported` 再回落 —— 能用，但每次打开正文都白发
+/// 一个请求。让后端自己说清楚，上游就能一次走对。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectBackend {
+    File,
+    S3,
+    Memory,
+}
+
+impl ObjectBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::S3 => "s3",
+            Self::Memory => "memory",
+        }
+    }
+}
+
 /// 对象自定义元数据：`(name, value)`，name 是不带 `x-cos-meta-` 前缀的短名。
 ///
 /// 按写入顺序展开，方便断言"七个自描述字段一个不少"（§5.2）。
@@ -58,6 +80,9 @@ impl std::error::Error for StoreError {}
 
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    /// 后端类型（自述用）。与 `presign_get` 能力强相关：`file` 一定不支持。
+    fn backend(&self) -> ObjectBackend;
+
     /// 写入一个**不可变**对象。键冲突按内容判重由调用方负责，这里只负责存。
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &ObjectMeta) -> Result<(), StoreError>;
 
@@ -122,6 +147,10 @@ impl MemoryObjectStore {
 
 #[async_trait]
 impl ObjectStore for MemoryObjectStore {
+    fn backend(&self) -> ObjectBackend {
+        ObjectBackend::Memory
+    }
+
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &ObjectMeta) -> Result<(), StoreError> {
         self.objects
             .write()
@@ -277,6 +306,10 @@ fn sync_dir(dir: &Path) {
 
 #[async_trait]
 impl ObjectStore for FileObjectStore {
+    fn backend(&self) -> ObjectBackend {
+        ObjectBackend::File
+    }
+
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &ObjectMeta) -> Result<(), StoreError> {
         let path = self.path_for(key)?;
         let meta_path = Self::meta_path(&path);
@@ -396,7 +429,7 @@ mod s3 {
     use aws_sdk_s3::config::{Credentials, Region};
     use aws_sdk_s3::primitives::ByteStream;
 
-    use super::{ObjectMeta, ObjectStore, StoreError};
+    use super::{ObjectBackend, ObjectMeta, ObjectStore, StoreError};
 
     #[derive(Debug)]
     pub struct S3ObjectStore {
@@ -437,6 +470,10 @@ mod s3 {
 
     #[async_trait]
     impl ObjectStore for S3ObjectStore {
+        fn backend(&self) -> ObjectBackend {
+            ObjectBackend::S3
+        }
+
         async fn put(
             &self,
             key: &str,

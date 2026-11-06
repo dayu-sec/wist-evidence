@@ -17,6 +17,7 @@
 | `GET /internal/evidence/{id}` 元数据读（跨租户/低敏感度 → 404） | ✅ |
 | `POST /internal/evidence/{id}:presign` 短签名（≤ 60s、单对象） | ✅（仅 `s3`） |
 | `GET /internal/evidence/{id}/content` 代理读正文 | ✅ |
+| `GET /healthz` 部署自述（`objects.kind`，上游据此选读正文通路） | ✅ |
 | PG 索引 / S3(COS) 对象 | ✅ 代码就绪（`pg` / `s3` feature），**未接真机** |
 | 清理作业、删除凭证、对账、索引重建、前缀级 STS、每客户 CMK | ⬜ P1+ |
 
@@ -100,6 +101,15 @@ OML 的输出必须是三字段 `cust_id` / `cmd_id` / `content`。
 |---|---|---|---|
 | `file` | 测试 / 现场验证 | `<objects.dir>/<键>`，元数据在同目录 `<键>.meta.json` | ❌（回 501，正文直接看文件） |
 | `s3` | 生产 | S3 兼容桶（腾讯 COS / MinIO） | ✅ SDK SigV4 |
+
+后端类型对外自述在 `/healthz` 的 `objects.kind` 里（两张监听同一口径）：
+
+```json
+{ "status": "ok", "objects": { "kind": "file" } }
+```
+
+上游（console BFF / 页面）读这个字段决定正文怎么打开 —— `file` 直接走代理读，
+不必先发一个必然 501 的 `:presign`。字段不认识（老实例）时上游按「先试签名」处理。
 
 ```toml
 # 本地文件（默认；重启不丢，能直接看）

@@ -14,7 +14,9 @@ use serde::Serialize;
 use crate::domain::Artifact;
 use crate::domain::artifact::{Durability, new_artifact_id, object_key};
 use crate::domain::kind::{Kind, RetentionClass, Sensitivity, Verdict};
-use crate::infra::{Index, IndexError, ListFilter, ObjectMeta, ObjectStore, StoreError};
+use crate::infra::{
+    Index, IndexError, ListFilter, ObjectBackend, ObjectMeta, ObjectStore, StoreError,
+};
 
 /// 短签名有效期上限（D8）：预签名 URL 是 bearer token，必须短命 + 单对象。
 pub const MAX_PRESIGN_TTL: Duration = Duration::from_secs(60);
@@ -184,6 +186,11 @@ impl EvidenceService {
         self.probe
             .as_ref()
             .map(|probe| probe.read().expect("probe status poisoned").clone())
+    }
+
+    /// 对象后端类型（自述用）：`/healthz` 的 `objects.kind`，上游据此避开一次无用的签名请求。
+    pub fn objects_backend(&self) -> ObjectBackend {
+        self.objects.backend()
     }
 
     /// **三字段写入**：`cust_id` / `cmd_id` / `content`（其余维度由调用层按部署配置填好）。

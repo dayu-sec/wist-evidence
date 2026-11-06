@@ -15,7 +15,8 @@ use tower::ServiceExt;
 use wist_evidence::api::{self, ReadState, SinkState};
 use wist_evidence::domain::Kind;
 use wist_evidence::infra::{
-    FileObjectStore, MemoryIndex, MemoryObjectStore, ObjectMeta, ObjectStore, StoreError,
+    FileObjectStore, MemoryIndex, MemoryObjectStore, ObjectBackend, ObjectMeta, ObjectStore,
+    StoreError,
 };
 use wist_evidence::service::EvidenceService;
 
@@ -584,6 +585,10 @@ struct FailingStore {
 
 #[async_trait::async_trait]
 impl ObjectStore for FailingStore {
+    fn backend(&self) -> ObjectBackend {
+        ObjectBackend::Memory
+    }
+
     async fn put(&self, _key: &str, _bytes: Vec<u8>, _meta: &ObjectMeta) -> Result<(), StoreError> {
         Err((self.error)())
     }
@@ -650,6 +655,10 @@ struct PresignFailsStore;
 
 #[async_trait::async_trait]
 impl ObjectStore for PresignFailsStore {
+    fn backend(&self) -> ObjectBackend {
+        ObjectBackend::Memory
+    }
+
     async fn put(&self, _key: &str, _bytes: Vec<u8>, _meta: &ObjectMeta) -> Result<(), StoreError> {
         Ok(())
     }
@@ -1025,6 +1034,25 @@ async fn healthz_has_no_probe_block_when_disabled() {
     assert!(body.get("probe").is_none(), "{body}");
 }
 
+/// `/healthz` 必须自述对象后端：console 据此直接走代理读，不再先撞一次 501。
+#[tokio::test]
+async fn healthz_reports_the_object_backend() {
+    let dir = std::env::temp_dir().join(format!("wist-evidence-healthz-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let file = file_harness(&dir);
+    // 两张监听同一口径（compose 打写端口、console 打读端口）。
+    for router in [&file.sink, &file.read] {
+        let body = get_healthz(router).await;
+        assert_eq!(body["objects"]["kind"], "file", "{body}");
+    }
+
+    let memory = harness();
+    let body = get_healthz(&memory.read).await;
+    assert_eq!(body["objects"]["kind"], "memory", "{body}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── 三字段形状：cust_id / cmd_id / content ──────────────────────────────────
 // ── 三字段形状：cust_id / cmd_id / content ──────────────
 
@@ -1093,6 +1121,45 @@ async fn simple_record_is_idempotent_on_cust_and_cmd() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["duplicates"], 1, "{body}");
     assert_eq!(h.index.len(), 1);
+    assert_eq!(h.object_count(), 1);
+}
+
+/// 真实数据面记录的完整形状：三字段之外还带一堆 OML / sink 标签输出的字段
+/// （`schema` / `agent` / `seq` / `event_id` / `wp_oml_name` …）。
+///
+/// 钉两件：多出来的键必须被忽略（`SimpleRecord` 不开 `deny_unknown_fields`，
+/// 否则一帧合法证据会被 400 打进 rescue）；同一个 `cust_id` + `cmd_id` + 正文重投
+/// 必须是幂等的（sink 的 `max_retries` 会让重投成为常态）。
+#[tokio::test]
+async fn a_full_data_plane_record_is_idempotent_and_extra_fields_are_ignored() {
+    let h = harness();
+    let record = json!({
+        "schema": "v1",
+        "agent": "agent-1",
+        "ts": "2026-10-30T10:00:05Z",
+        "seq": 7,
+        "event_id": "1234567890",
+        "wp_oml_name": "agent_uplink_ivsrep",
+        "biz": "agent-ivsrep",
+        "cust_id": "c-002",
+        "cmd_id": "cmd-full-1",
+        // 与 OML `content = read(body)` 同形：正文是**字符串**，不是对象。
+        "content": "{\"command_id\":\"cmd-full-1\",\"report_schema\":\"wist.investigation.disk/v1\"}",
+    });
+
+    let (status, first) = post_record(&h.sink, record.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let artifact_id = first["artifacts"][0]["artifact_id"]
+        .as_str()
+        .expect("artifact id")
+        .to_string();
+    assert_eq!(first["duplicates"], 0, "{first}");
+
+    let (status, second) = post_record(&h.sink, record).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["duplicates"], 1, "{second}");
+    assert_eq!(second["artifacts"][0]["artifact_id"], artifact_id);
+    assert_eq!(h.index.len(), 1, "多出来的键不该影响去重");
     assert_eq!(h.object_count(), 1);
 }
 

@@ -2,7 +2,9 @@ pub mod index;
 pub mod object_store;
 
 pub use index::{Index, IndexError, ListFilter, MemoryIndex};
-pub use object_store::{FileObjectStore, MemoryObjectStore, ObjectMeta, ObjectStore, StoreError};
+pub use object_store::{
+    FileObjectStore, MemoryObjectStore, ObjectBackend, ObjectMeta, ObjectStore, StoreError,
+};
 
 #[cfg(feature = "pg")]
 pub use index::PgIndex;
