@@ -21,6 +21,9 @@ default_sensitivity = "paths"
 # ── 读面：内部服务（mTLS + scope；P0 由 TLS 终结层注入身份头）────────────────
 [read]
 listen_addr = "127.0.0.1:19174"
+# 读口最小鉴权：配了就必须带 `x-evidence-service-token`。
+# 不配 = 保持旧行为（身份头是调用方自述，只靠网络隔离），启动日志会 warn。
+# service_token = "${SEC_EVIDENCE_READ_TOKEN}"
 
 # ── 索引 ─────────────────────────────────────────────────────────────────────
 [index]
