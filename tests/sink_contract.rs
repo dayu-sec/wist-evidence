@@ -124,6 +124,7 @@ fn harness_with(
         sink: api::sink_router(sink_state, 4 * 1024 * 1024),
         read: api::read_router(ReadState {
             service: service.clone(),
+            service_token: None,
         }),
         index,
         memory,
@@ -1244,4 +1245,38 @@ async fn array_body_writes_every_record() {
     assert_eq!(body["duplicates"], 0);
     assert_eq!(h.index.len(), 3);
     assert_eq!(h.object_count(), 3);
+}
+
+/// 配了读口服务 token：不带 / 带错一律 401，带对才走到正常的「不可见 → 404」路径。
+///
+/// P0 的身份头（tenant / scopes）是**调用方自述**；没有这道 token，
+/// 内网里任何进程改个头就能读任何租户。
+#[tokio::test]
+async fn read_endpoint_requires_the_service_token_when_configured() {
+    let h = harness();
+    let guarded = api::read_router(ReadState {
+        service: h.service.clone(),
+        service_token: Some("read-secret".to_string()),
+    });
+
+    let request = |token: Option<&str>| {
+        let mut builder = Request::builder()
+            .uri("/internal/evidence/cmd-1")
+            .header("x-evidence-tenant", CUST)
+            .header("x-evidence-scopes", "evidence:read");
+        if let Some(token) = token {
+            builder = builder.header("x-evidence-service-token", token);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+
+    let missing = guarded.clone().oneshot(request(None)).await.unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong = guarded.clone().oneshot(request(Some("nope"))).await.unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    // 带对了：不再被鉴权挡住（这里没有这条证据，所以是 404，不是 401）。
+    let ok = guarded.oneshot(request(Some("read-secret"))).await.unwrap();
+    assert_eq!(ok.status(), StatusCode::NOT_FOUND);
 }

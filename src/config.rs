@@ -56,6 +56,12 @@ pub struct SinkConfig {
 #[derive(Debug, Clone)]
 pub struct ReadConfig {
     pub listen_addr: String,
+    /// 读口最小鉴权：配了就必须带 `x-evidence-service-token`。
+    ///
+    /// P0 的身份头（`x-evidence-tenant` / `x-evidence-scopes`）是调用方自述 —— 内网里
+    /// 任何进程改个头就能读任何租户。加一道服务级 token 把「谁可以调读口」收到发钥方，
+    /// 比把身份头当授权可靠。没配 = 保持旧行为（仅内网隔离），启动日志会提醒。
+    pub service_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,12 +207,16 @@ impl Default for RawSink {
 struct RawRead {
     #[serde(default = "default_read_addr")]
     listen_addr: String,
+    /// 读口服务 token（通常写 `${SEC_EVIDENCE_READ_TOKEN}`）。
+    #[serde(default)]
+    service_token: Option<String>,
 }
 
 impl Default for RawRead {
     fn default() -> Self {
         Self {
             listen_addr: default_read_addr(),
+            service_token: None,
         }
     }
 }
@@ -441,6 +451,10 @@ impl RawConfig {
             },
             read: ReadConfig {
                 listen_addr: expand(env, &self.read.listen_addr)?,
+                service_token: match self.read.service_token.as_deref() {
+                    Some(raw) if !raw.trim().is_empty() => Some(expand(env, raw)?),
+                    _ => None,
+                },
             },
             index: IndexConfig {
                 kind: index_kind,

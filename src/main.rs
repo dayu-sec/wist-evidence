@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let read_state = ReadState {
         service: service.clone(),
+        service_token: config.read.service_token.clone(),
     };
 
     let sink_app = api::sink_router(sink_state, config.sink.max_body_bytes);
@@ -70,6 +71,13 @@ async fn main() -> anyhow::Result<()> {
             "off".to_string()
         }
     );
+
+    if config.read.service_token.is_none() {
+        log::warn!(
+            "wist-evidence read endpoint has NO service token: identity headers are trusted as-is \
+             (any in-network caller can claim any tenant); set `[read] service_token` to enable the check"
+        );
+    }
 
     let sink_listener = tokio::net::TcpListener::bind(&config.sink.listen_addr)
         .await

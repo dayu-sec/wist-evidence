@@ -30,10 +30,12 @@ pub struct SinkState {
     pub default_sensitivity: Sensitivity,
 }
 
-/// 读端点的状态：只需要服务（身份来自请求头 / 将来的证书）。
+/// 读端点的状态：服务 + 可选的服务 token（配了就必须带）。
 #[derive(Clone)]
 pub struct ReadState {
     pub service: Arc<EvidenceService>,
+    /// `Some(_)` = 读口要求 `x-evidence-service-token`；`None` = 未配，保持旧行为。
+    pub service_token: Option<String>,
 }
 
 pub fn sink_router(state: SinkState, max_body_bytes: usize) -> Router {

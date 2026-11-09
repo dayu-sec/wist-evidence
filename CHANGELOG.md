@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 0.1.16 · 2026-11-10
+
+- **读端点最小鉴权（`[read] service_token`）**：配了就必须带
+  `x-evidence-service-token`；没带 / 不对一律 401。
+  原因：P0 的身份头（`x-evidence-tenant` / `x-evidence-scopes`）是**调用方自述**，
+  边界只有网络隔离 —— 内网里任何进程改个头就能读任何租户。
+- **没配 token 时保持旧行为**并打一条启动警告（`warn`）：现有部署升级不会被拒，
+  但日志里会直接给出待办。写端点（sink）本轮不变。
+- 比较用常量时间，不长短泄露。
+
 ## 0.1.15 · 2026-11-09
 
 - **读端点可以用调查命令 id（`cmd_id`）定位**：`GET /internal/evidence/{id}`、

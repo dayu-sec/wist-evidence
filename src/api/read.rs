@@ -21,7 +21,7 @@ pub async fn metadata(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> Response {
-    let principal = match principal_from_headers(&headers) {
+    let principal = match principal_from_headers(&state, &headers) {
         Some(principal) => principal,
         None => return unauthorized(),
     };
@@ -57,7 +57,7 @@ pub async fn list_evidence(
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Response {
-    let principal = match principal_from_headers(&headers) {
+    let principal = match principal_from_headers(&state, &headers) {
         Some(principal) => principal,
         None => return unauthorized(),
     };
@@ -134,7 +134,7 @@ pub async fn presign_at(
     if key.is_empty() {
         return read_error_response(ReadError::NotFound);
     }
-    let principal = match principal_from_headers(&headers) {
+    let principal = match principal_from_headers(&state, &headers) {
         Some(principal) => principal,
         None => return unauthorized(),
     };
@@ -161,7 +161,7 @@ pub async fn content(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> Response {
-    let principal = match principal_from_headers(&headers) {
+    let principal = match principal_from_headers(&state, &headers) {
         Some(principal) => principal,
         None => return unauthorized(),
     };
@@ -182,7 +182,16 @@ pub async fn content(
 }
 
 /// 从请求头取身份。P0：由内网 TLS 终结层注入；CA-I 落地后换成证书 claim。
-fn principal_from_headers(headers: &HeaderMap) -> Option<ReadPrincipal> {
+///
+/// 配了 `[read] service_token` 时先校 token：身份头是**调用方自述**的，
+/// 不先校“谁可以调读口”，等于把租户边界交给请求方自己声明。
+fn principal_from_headers(state: &ReadState, headers: &HeaderMap) -> Option<ReadPrincipal> {
+    if let Some(expected) = state.service_token.as_deref() {
+        let provided = header_value(headers, "x-evidence-service-token")?;
+        if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+            return None;
+        }
+    }
     let tenant_ids: Vec<String> = header_csv(headers, "x-evidence-tenant")?;
     if tenant_ids.is_empty() {
         return None;
@@ -213,6 +222,18 @@ fn header_csv(headers: &HeaderMap, name: &str) -> Option<Vec<String>> {
             .filter(|item| !item.is_empty())
             .collect()
     })
+}
+
+/// 常量时间比较：token 不长短泄漏（长度不同直接不等，不逐字节提前退出）。
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (l, r) in left.iter().zip(right) {
+        diff |= l ^ r;
+    }
+    diff == 0
 }
 
 fn unauthorized() -> Response {
