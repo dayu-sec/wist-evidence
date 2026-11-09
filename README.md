@@ -21,6 +21,11 @@
 | PG 索引 / S3(COS) 对象 | ✅ 代码就绪（`pg` / `s3` feature），**未接真机** |
 | 清理作业、删除凭证、对账、索引重建、前缀级 STS、每客户 CMK | ⬜ P1+ |
 
+> 读端点的 `{id}` 可以是**调查命令 id**（`cmd_id`）——发起调查的人手里只有这个；
+> 也可以是内部 `artifact_id`（`art_…`，列表行里给）。证据服务先按 `artifact_id` 再按
+> `command_id` 找，两者指向同一行；可见性 / 租户 / 敏感度闸不变。
+> 列表接口 `GET /internal/evidence?cmd_id=...` 也支持按命令 id 直接筛。
+
 ## 两张监听，两套信任模型
 
 | 面 | 端口 | 身份 | 为什么分开 |
@@ -186,13 +191,14 @@ curl -sS -X POST http://127.0.0.1:19173/internal/evidence \
   -d '{"cust_id":"c-001","cmd_id":"cmd-1","content":{"report_schema":"wist.investigation.disk/v1","summary":{"overall":"warn"}}}'
 
 # 读元数据（P0 由 TLS 终结层注入身份；本机联调直接带头）
-curl -sS http://127.0.0.1:19174/internal/evidence/art_... \
+# 路径里的 `cmd-1` 是调查命令 id；换成列表行里的 `art_...` 也一样能读。
+curl -sS http://127.0.0.1:19174/internal/evidence/cmd-1 \
   -H 'x-evidence-tenant: c-001' \
   -H 'x-evidence-scopes: evidence:read' \
   -H 'x-evidence-max-sensitivity: paths'
 
 # 短签名（60s 上限）
-curl -sS -X POST 'http://127.0.0.1:19174/internal/evidence/art_...:presign' \
+curl -sS -X POST 'http://127.0.0.1:19174/internal/evidence/cmd-1:presign' \
   -H 'x-evidence-tenant: c-001' -H 'x-evidence-scopes: evidence:read' \
   -H 'x-evidence-max-sensitivity: paths' -H 'Content-Type: application/json' \
   -d '{"ttl_seconds":600}'

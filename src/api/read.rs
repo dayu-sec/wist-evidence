@@ -19,13 +19,13 @@ use super::ReadState;
 pub async fn metadata(
     State(state): State<ReadState>,
     headers: HeaderMap,
-    Path(artifact_id): Path<String>,
+    Path(key): Path<String>,
 ) -> Response {
     let principal = match principal_from_headers(&headers) {
         Some(principal) => principal,
         None => return unauthorized(),
     };
-    match state.service.metadata(&principal, &artifact_id).await {
+    match state.service.metadata(&principal, &key).await {
         Ok(artifact) => Json(artifact).into_response(),
         Err(error) => read_error_response(error),
     }
@@ -37,6 +37,9 @@ pub struct ListQuery {
     pub kind: Option<String>,
     #[serde(default)]
     pub subject_id: Option<String>,
+    /// 调查命令 id：发起调查的人手里只有这个，页面上也是主筛选位。
+    #[serde(default)]
+    pub cmd_id: Option<String>,
     #[serde(default)]
     pub since: Option<String>,
     #[serde(default)]
@@ -76,6 +79,7 @@ pub async fn list_evidence(
     let filter = ListFilter {
         kind,
         subject_id: query.subject_id.filter(|value| !value.is_empty()),
+        command_id: query.cmd_id.filter(|value| !value.is_empty()),
         since,
     };
     let tenant = query.tenant.unwrap_or(fallback_tenant);
@@ -112,9 +116,11 @@ pub struct PresignRequest {
     pub ttl_seconds: Option<u64>,
 }
 
-/// `POST /internal/evidence/{artifact_id}:presign`。
+/// `POST /internal/evidence/{key}:presign`。
 ///
-/// matchit 不允许参数段和通配段做兄弟，所以 `{artifact_id}` 会把 `art_x:presign`
+/// `{key}` 可以是证据 id（`art_…`），也可以是调查命令 id（`cmd_id`）：
+/// 发起调查的人手里只有后者，读接口要能拿它直接定位（见 `find_visible`）。
+/// matchit 不允许参数段和通配段做兄弟，所以 `{key}` 会把 `art_x:presign`
 /// 整段吃下来，由这里拆出动作 —— 对外仍保持设计稿 §12.2 的 `:presign` 形状。
 pub async fn presign_at(
     State(state): State<ReadState>,
@@ -122,10 +128,10 @@ pub async fn presign_at(
     Path(raw): Path<String>,
     body: Option<Json<PresignRequest>>,
 ) -> Response {
-    let Some(artifact_id) = raw.strip_suffix(":presign") else {
+    let Some(key) = raw.strip_suffix(":presign") else {
         return read_error_response(ReadError::NotFound);
     };
-    if artifact_id.is_empty() {
+    if key.is_empty() {
         return read_error_response(ReadError::NotFound);
     }
     let principal = match principal_from_headers(&headers) {
@@ -137,11 +143,7 @@ pub async fn presign_at(
         .unwrap_or(60);
     match state
         .service
-        .presign(
-            &principal,
-            artifact_id,
-            std::time::Duration::from_secs(ttl_seconds),
-        )
+        .presign(&principal, key, std::time::Duration::from_secs(ttl_seconds))
         .await
     {
         Ok(outcome) => Json::<PresignOutcome>(outcome).into_response(),
@@ -149,20 +151,21 @@ pub async fn presign_at(
     }
 }
 
-/// `GET /internal/evidence/{artifact_id}/content`——代理读正文（§7.2）。
+/// `GET /internal/evidence/{key}/content`——代理读正文（§7.2）。
 ///
+/// `{key}` 同元数据读：证据 id 或调查命令 id 都可以。
 /// 可见性判断与元数据读一致；正文在对象层是 zstd 压缩的，这里解压后回原文。
 /// 本地文件模式（`objects.kind = file`）没有签名 URL，就靠这条读正文。
 pub async fn content(
     State(state): State<ReadState>,
     headers: HeaderMap,
-    Path(artifact_id): Path<String>,
+    Path(key): Path<String>,
 ) -> Response {
     let principal = match principal_from_headers(&headers) {
         Some(principal) => principal,
         None => return unauthorized(),
     };
-    match state.service.read_content(&principal, &artifact_id).await {
+    match state.service.read_content(&principal, &key).await {
         Ok((_artifact, body)) => (
             [
                 (header::CONTENT_TYPE, "application/json; charset=utf-8"),

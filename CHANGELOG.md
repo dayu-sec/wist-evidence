@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 0.1.15 · 2026-11-09
+
+- **读端点可以用调查命令 id（`cmd_id`）定位**：`GET /internal/evidence/{id}`、
+  `POST /internal/evidence/{id}:presign`、`GET /internal/evidence/{id}/content` 的
+  `{id}` 先当 `artifact_id` 找，找不到再当 `command_id` 找。
+  发起调查的人手里只有 `cmd_id`（证据 id 是不透明的、也不该由人转抄），
+  之前只能先列一遍索引再从行里取 `artifact_id`。两套 id 指向同一行，
+  租户 / scope / 敏感度 / 保留期闸全部不变；跨租户仍然 404。
+- 索引新增 `find_by_command`（PG 按 `command_id` + `reported_at desc limit 1`；
+  同命令多行时取最近写入的一行）。
+
 ## 0.1.14 · 2026-11-06
 
 - **`/healthz` 自述对象后端**：读写两张监听都回 `"objects": {"kind": "file"|"s3"}`。

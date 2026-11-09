@@ -51,15 +51,14 @@ pub fn read_router(state: ReadState) -> Router {
     Router::new()
         .route("/healthz", get(read_healthz))
         .route("/internal/evidence", get(read::list_evidence))
+        // `{key}` 可以是证据 id（`art_…`）或调查命令 id（`cmd_id`）：
+        // 发起调查的人手里只有后一个（见 `EvidenceService::find_visible`）。
         .route(
-            "/internal/evidence/{artifact_id}",
+            "/internal/evidence/{key}",
             get(read::metadata).post(read::presign_at),
         )
         // 代理读正文（§7.2）：本地文件模式没有签名 URL，这是唯一的读正文通路。
-        .route(
-            "/internal/evidence/{artifact_id}/content",
-            get(read::content),
-        )
+        .route("/internal/evidence/{key}/content", get(read::content))
         .with_state(state)
 }
 

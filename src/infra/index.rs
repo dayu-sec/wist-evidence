@@ -36,6 +36,8 @@ impl std::error::Error for IndexError {}
 pub struct ListFilter {
     pub kind: Option<Kind>,
     pub subject_id: Option<String>,
+    /// 调查命令 id：发起调查的人手里只有这个，也是页面上最自然的入口。
+    pub command_id: Option<String>,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -53,6 +55,18 @@ pub trait Index: Send + Sync {
     /// 按 id 读一行；**必须带租户**，否则跨租户会变成"能猜就能读"。
     async fn get(&self, tenant_id: &str, artifact_id: &str)
     -> Result<Option<Artifact>, IndexError>;
+
+    /// 按调查命令 id（`cmd_id`）找当前行。
+    ///
+    /// 发起调查的人手里只有这个 id（证据 id 是不透明的、也不该由人转抄），
+    /// 所以读接口要能拿它直接定位。唯一键仍然是
+    /// `(tenant, kind, subject, dedupe_key)`：极端情况下同一个命令可以在不同 kind 下落
+    /// 多行（目前只有 `investigation_report` 帧带命令 id），这里取**最近写入的一行**。
+    async fn find_by_command(
+        &self,
+        tenant_id: &str,
+        command_id: &str,
+    ) -> Result<Option<Artifact>, IndexError>;
 
     /// 时间倒序列表。`cursor` 是**不透明**字符串，P0 实现成十进制 offset。
     async fn list(
@@ -138,6 +152,24 @@ impl Index for MemoryIndex {
             .cloned())
     }
 
+    async fn find_by_command(
+        &self,
+        tenant_id: &str,
+        command_id: &str,
+    ) -> Result<Option<Artifact>, IndexError> {
+        Ok(self
+            .rows
+            .read()
+            .expect("memory index poisoned")
+            .values()
+            .filter(|row| {
+                row.tenant_id == tenant_id && row.command_id.as_deref() == Some(command_id)
+            })
+            // 同命令多行（不同 kind）时取最近写入的那行：人要看的是「这次调查的结果」。
+            .max_by_key(|row| (row.reported_at, row.stored_at))
+            .cloned())
+    }
+
     async fn insert(&self, artifact: &Artifact) -> Result<(), IndexError> {
         let mut rows = self.rows.write().expect("memory index poisoned");
         let duplicate = rows.values().any(|row| {
@@ -173,6 +205,12 @@ impl Index for MemoryIndex {
                     .subject_id
                     .as_deref()
                     .is_none_or(|subject| row.subject_id == subject)
+            })
+            .filter(|row| {
+                filter
+                    .command_id
+                    .as_deref()
+                    .is_none_or(|command| row.command_id.as_deref() == Some(command))
             })
             .filter(|row| filter.since.is_none_or(|since| row.reported_at >= since))
             .cloned()
@@ -370,6 +408,31 @@ mod pg {
             .map_err(|err| IndexError::Backend(format!("get artifact: {err}")))
         }
 
+        async fn find_by_command(
+            &self,
+            tenant_id: &str,
+            command_id: &str,
+        ) -> Result<Option<Artifact>, IndexError> {
+            // 同命令多行（不同 kind）时取最近写入的那行；`command_id` 可空，
+            // 无命令的产物靠 `artifact_id` 读，不在这条路里。
+            sqlx::query_as::<_, Row>(
+                "select artifact_id, tenant_id, customer_id, kind, subtype, subject_type, \
+                 subject_id, gateway_id, agent_id, command_id, dedupe_key, schema_id, sensitivity, \
+                 retention_class, bucket, object_key, size_bytes, sha256, verdict, marker_ids, \
+                 source_ref, source_sha256, durability, reported_at, stored_at, retention_until, \
+                 legal_hold, state \
+                 from evidence_artifact \
+                 where tenant_id = $1 and command_id = $2 \
+                 order by reported_at desc, stored_at desc limit 1",
+            )
+            .bind(tenant_id)
+            .bind(command_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.map(Artifact::from))
+            .map_err(|err| IndexError::Backend(format!("find by command: {err}")))
+        }
+
         async fn list(
             &self,
             tenant_id: &str,
@@ -381,7 +444,7 @@ mod pg {
                 .and_then(|raw| raw.parse().ok())
                 .unwrap_or(0_i64)
                 .max(0);
-            // 一个静态语句盖住四种组合：`$n is null or …` 让可选筛选不需要拼 SQL
+            // 一个静态语句盖住五种组合：`$n is null or …` 让可选筛选不需要拼 SQL
             // （sqlx 0.9 不接受拼出来的字符串）。
             let rows = sqlx::query_as::<_, Row>(
                 "select artifact_id, tenant_id, customer_id, kind, subtype, subject_type, \
@@ -394,13 +457,15 @@ mod pg {
                and ($2::text is null or kind = $2) \
                and ($3::text is null or subject_id = $3) \
                and ($4::timestamptz is null or reported_at >= $4) \
+               and ($5::text is null or command_id = $5) \
              order by reported_at desc \
-             limit $5 offset $6",
+             limit $6 offset $7",
             )
             .bind(tenant_id)
             .bind(filter.kind.map(|kind| kind.as_str()))
             .bind(filter.subject_id.as_deref())
             .bind(filter.since)
+            .bind(filter.command_id.as_deref())
             .bind(limit as i64)
             .bind(offset)
             .fetch_all(&self.pool)

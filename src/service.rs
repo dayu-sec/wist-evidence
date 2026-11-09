@@ -373,12 +373,15 @@ impl EvidenceService {
     }
 
     /// 元数据读（不含正文）。所有"不能给"的理由统一回 `NotFound`。
+    ///
+    /// `key` 可以是证据 id（`art_…`），也可以是调查命令 id（`cmd_id`）——
+    /// 两者都能定位到同一行，定位规则见 `find_visible`。
     pub async fn metadata(
         &self,
         principal: &ReadPrincipal,
-        artifact_id: &str,
+        key: &str,
     ) -> Result<Artifact, ReadError> {
-        let artifact = self.find_visible(principal, artifact_id).await?;
+        let artifact = self.find_visible(principal, key).await?;
         Ok(artifact)
     }
 
@@ -439,9 +442,9 @@ impl EvidenceService {
     pub async fn read_content(
         &self,
         principal: &ReadPrincipal,
-        artifact_id: &str,
+        key: &str,
     ) -> Result<(Artifact, Vec<u8>), ReadError> {
-        let artifact = self.find_visible(principal, artifact_id).await?;
+        let artifact = self.find_visible(principal, key).await?;
         let stored = self
             .objects
             .get(&artifact.object_key)
@@ -468,14 +471,14 @@ impl EvidenceService {
         Ok((artifact, body))
     }
 
-    /// 短签名：单对象、≤ 60s。
+    /// 短签名：单对象、≤ 60s。`key` 同元数据读：证据 id 或调查命令 id。
     pub async fn presign(
         &self,
         principal: &ReadPrincipal,
-        artifact_id: &str,
+        key: &str,
         ttl: Duration,
     ) -> Result<PresignOutcome, ReadError> {
-        let artifact = self.find_visible(principal, artifact_id).await?;
+        let artifact = self.find_visible(principal, key).await?;
         let ttl = ttl.min(MAX_PRESIGN_TTL);
         let url = self
             .objects
@@ -533,6 +536,7 @@ impl EvidenceService {
         let filter = ListFilter {
             kind: None,
             subject_id: Some(PROBE_SUBJECT.to_string()),
+            command_id: None,
             since: None,
         };
         let mut purged = 0u64;
@@ -572,21 +576,39 @@ impl EvidenceService {
         Ok(purged)
     }
 
+    /// 定位一行可见的产物。
+    ///
+    /// `key` 先当**证据 id**（`art_…`，列表行里给内部导航用）找；找不到再当
+    /// **调查命令 id**（`cmd_id`，发起调查的人手里只有这个）找。两套 id 不混用：
+    /// 证据 id 不透明、命令 id 也不应该长成 `art_`，先后顺序只是实现细节。
     async fn find_visible(
         &self,
         principal: &ReadPrincipal,
-        artifact_id: &str,
+        key: &str,
     ) -> Result<Artifact, ReadError> {
         let mut found = None;
         for tenant in &principal.tenant_ids {
             if let Some(row) = self
                 .index
-                .get(tenant, artifact_id)
+                .get(tenant, key)
                 .await
                 .map_err(|err| ReadError::Backend(err.to_string()))?
             {
                 found = Some(row);
                 break;
+            }
+        }
+        if found.is_none() {
+            for tenant in &principal.tenant_ids {
+                if let Some(row) = self
+                    .index
+                    .find_by_command(tenant, key)
+                    .await
+                    .map_err(|err| ReadError::Backend(err.to_string()))?
+                {
+                    found = Some(row);
+                    break;
+                }
             }
         }
         let artifact = found.ok_or(ReadError::NotFound)?;

@@ -195,14 +195,25 @@ async fn post_record(sink: &Router, record: Value) -> (StatusCode, Value) {
 }
 
 async fn get_metadata(read: &Router, tenant: &str, artifact_id: &str) -> StatusCode {
+    get_metadata_json(read, tenant, artifact_id).await.0
+}
+
+/// 同一个请求，但把响应正文带回来：断言「命令 id 与证据 id 指向同一行」时要用。
+async fn get_metadata_json(read: &Router, tenant: &str, key: &str) -> (StatusCode, Value) {
     let request = Request::builder()
-        .uri(format!("/internal/evidence/{artifact_id}"))
+        .uri(format!("/internal/evidence/{key}"))
         .header("x-evidence-tenant", tenant)
         .header("x-evidence-scopes", "evidence:read")
         .header("x-evidence-max-sensitivity", "commandlines")
         .body(Body::empty())
         .unwrap();
-    read.clone().oneshot(request).await.unwrap().status()
+    let response = read.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 async fn list(
@@ -268,6 +279,45 @@ async fn replaying_the_same_record_is_idempotent() {
 
     assert_eq!(h.index.len(), 1, "one dedupe key = one row");
     assert_eq!(h.object_count(), 1, "replay must not write a second object");
+}
+
+#[tokio::test]
+async fn a_read_can_be_addressed_by_the_investigation_command_id() {
+    let h = harness();
+    let (_, written) = post_record(&h.sink, record("cmd-by-command", "warn")).await;
+    let artifact_id = written["artifacts"][0]["artifact_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 发起调查的人手里只有 cmd_id：元数据与短签名都要能直接用它读回同一行。
+    let (status, body) = get_metadata_json(&h.read, "c-001", "cmd-by-command").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["artifact_id"], artifact_id);
+    assert_eq!(body["command_id"], "cmd-by-command");
+
+    let (status, signed) = presign(&h.read, "cmd-by-command", 60).await;
+    assert_eq!(status, StatusCode::OK, "{signed}");
+    assert_eq!(signed["artifact_id"], artifact_id);
+
+    // 跨租户照样 404：命令 id 不是绕过租户隔离的钥匙。
+    assert_eq!(
+        get_metadata(&h.read, "c-002", "cmd-by-command").await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn list_can_be_filtered_by_the_investigation_command_id() {
+    let h = harness();
+    post_record(&h.sink, record("cmd-filter-1", "ok")).await;
+    post_record(&h.sink, record("cmd-filter-2", "warn")).await;
+
+    let (status, page) = list(&h.read, "c-001", "paths", "?cmd_id=cmd-filter-1").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let artifacts = page["artifacts"].as_array().expect("artifacts");
+    assert_eq!(artifacts.len(), 1, "{page}");
+    assert_eq!(artifacts[0]["command_id"], "cmd-filter-1");
 }
 
 #[tokio::test]
@@ -760,6 +810,20 @@ async fn content_returns_the_original_body() {
     assert_eq!(
         String::from_utf8(bytes).unwrap(),
         report("cmd-content-1", "warn")
+    );
+}
+
+#[tokio::test]
+async fn content_can_be_read_by_the_investigation_command_id() {
+    let dir = TempDirGuard::new("content-by-command");
+    let h = file_harness(dir.path());
+    post_record(&h.sink, record("cmd-content-by-command", "warn")).await;
+
+    let (status, _, bytes) = get_content(&h.read, "c-001", "cmd-content-by-command").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        String::from_utf8(bytes).unwrap(),
+        report("cmd-content-by-command", "warn")
     );
 }
 
