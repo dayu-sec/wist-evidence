@@ -1273,7 +1273,11 @@ async fn read_endpoint_requires_the_service_token_when_configured() {
     let missing = guarded.clone().oneshot(request(None)).await.unwrap();
     assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
 
-    let wrong = guarded.clone().oneshot(request(Some("nope"))).await.unwrap();
+    let wrong = guarded
+        .clone()
+        .oneshot(request(Some("nope")))
+        .await
+        .unwrap();
     assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
 
     // 带对了：不再被鉴权挡住（这里没有这条证据，所以是 404，不是 401）。
