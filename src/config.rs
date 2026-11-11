@@ -28,6 +28,19 @@ pub struct Config {
     pub index: IndexConfig,
     pub objects: ObjectsConfig,
     pub probe: ProbeConfig,
+    /// 多客户：客户 id → 独立后端。**空 = 单后端部署**（行为与旧版完全一致）。
+    pub cells: Vec<CellConfig>,
+}
+
+/// 一个客户的专属后端（`[[storage.cell]]`）。
+///
+/// `index` / `objects` 的字段含义与顶层同名段一致，只是各自指向独立的 PG / 对象目录。
+#[derive(Debug, Clone)]
+pub struct CellConfig {
+    /// 与写入 body 的 `cust_id` 完全一致（也是读口的 `x-evidence-tenant`）。
+    pub cust_id: String,
+    pub index: IndexConfig,
+    pub objects: ObjectsConfig,
 }
 
 /// 写探针：每隔 `interval_secs` 往自己的写路径投一条探针证据，
@@ -172,6 +185,26 @@ struct RawConfig {
     objects: RawObjects,
     #[serde(default)]
     probe: RawProbe,
+    /// 多客户路由表（`[[storage.cell]]`）。不写就是一坡单后端。
+    #[serde(default)]
+    storage: RawStorage,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawStorage {
+    /// TOML 里写 `[[storage.cell]]`：单数，因为每一条是一个客户（不是列表字段的惯用命名）。
+    #[serde(default)]
+    cell: Vec<RawCell>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCell {
+    /// 客户 id：写请求 body 的 `cust_id` / 读口的 `x-evidence-tenant`。
+    cust_id: String,
+    /// **必填**：缺了不能默认成 memory（那会把客户数据写进内存、重启就没）。
+    index: Option<RawIndex>,
+    /// **必填**：同理，不能默认成 `./data/objects` 把多个客户写进同一个目录。
+    objects: Option<RawObjects>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,6 +367,71 @@ fn default_bucket() -> String {
     "wist-evidence-dev".to_string()
 }
 
+/// 解析一个 `[index]` 段（顶层与 `[[storage.cell]]` 共用同一口径）。
+fn resolve_index(env: &EnvDict, raw: &RawIndex) -> anyhow::Result<IndexConfig> {
+    let kind = match raw.kind.trim() {
+        "memory" => IndexKind::Memory,
+        "postgres" => IndexKind::Postgres,
+        other => bail!("index.kind must be memory|postgres, got {other:?}"),
+    };
+    let database_url = if raw.database_url.trim().is_empty() {
+        None
+    } else {
+        Some(expand(env, &raw.database_url)?)
+    };
+    if kind == IndexKind::Postgres && database_url.is_none() {
+        bail!("index.kind = postgres requires index.database_url");
+    }
+    Ok(IndexConfig { kind, database_url })
+}
+
+/// 解析一个 `[objects]` 段（顶层与 `[[storage.cell]]` 共用同一口径）。
+fn resolve_objects(env: &EnvDict, raw: &RawObjects) -> anyhow::Result<ObjectsConfig> {
+    // 存储后端也由环境变量选（`EVIDENCE_STORE_KIND=file|s3`）：切换模式不需要改配置文件。
+    let raw_kind = expand(env, &raw.kind)?;
+    let kind = match raw_kind.trim() {
+        "file" => ObjectsKind::File,
+        "s3" => ObjectsKind::S3,
+        other => bail!(
+            "objects.kind must be file|s3, got {other:?} \
+             （from 0.1.7 the memory backend is gone）"
+        ),
+    };
+    let bucket = expand(env, &raw.bucket)?;
+    if bucket.trim().is_empty() {
+        bail!("objects.bucket must not be empty");
+    }
+    let dir = optional_expanded(env, &raw.dir)?;
+    // COS 四个字段在配置文件里**常驻**（不然切模式还得改文件），所以 file 模式下
+    // 它们解析不出来只当「没配」；真选 s3 时再 fail-closed。
+    let cos_required = kind == ObjectsKind::S3;
+    let endpoint = optional_expanded_lax(env, &raw.endpoint, cos_required)?;
+    let region = optional_expanded_lax(env, &raw.region, cos_required)?;
+    let access_key = optional_expanded_lax(env, &raw.access_key, cos_required)?;
+    let secret_key = optional_expanded_lax(env, &raw.secret_key, cos_required)?;
+    if kind == ObjectsKind::File && dir.is_none() {
+        // 相对路径相对进程工作目录；容器里给绝对路径（挂载点）。
+        bail!("objects.kind = file requires objects.dir");
+    }
+    if kind == ObjectsKind::S3 {
+        if endpoint.is_none() || region.is_none() {
+            bail!("objects.kind = s3 requires objects.endpoint and objects.region");
+        }
+        if access_key.is_none() || secret_key.is_none() {
+            bail!("objects.kind = s3 requires objects.access_key and objects.secret_key");
+        }
+    }
+    Ok(ObjectsConfig {
+        kind,
+        dir,
+        bucket,
+        endpoint,
+        region,
+        access_key,
+        secret_key,
+    })
+}
+
 impl RawConfig {
     fn resolve(self, env: &EnvDict) -> anyhow::Result<Config> {
         if self.sink.max_body_bytes == 0 || self.sink.max_body_bytes > HARD_MAX_BODY_BYTES {
@@ -378,53 +476,42 @@ impl RawConfig {
             );
         }
 
-        let index_kind = match self.index.kind.trim() {
-            "memory" => IndexKind::Memory,
-            "postgres" => IndexKind::Postgres,
-            other => bail!("index.kind must be memory|postgres, got {other:?}"),
-        };
-        let database_url = if self.index.database_url.trim().is_empty() {
-            None
-        } else {
-            Some(expand(env, &self.index.database_url)?)
-        };
-        if index_kind == IndexKind::Postgres && database_url.is_none() {
-            bail!("index.kind = postgres requires index.database_url");
-        }
+        let index_config = resolve_index(env, &self.index)?;
+        let objects_config = resolve_objects(env, &self.objects)?;
 
-        // 存储后端也由环境变量选（`EVIDENCE_STORE_KIND=file|s3`）：切换模式不需要改配置文件。
-        let raw_kind = expand(env, &self.objects.kind)?;
-        let objects_kind = match raw_kind.trim() {
-            "file" => ObjectsKind::File,
-            "s3" => ObjectsKind::S3,
-            other => bail!(
-                "objects.kind must be file|s3, got {other:?} \
-                 （from 0.1.7 the memory backend is gone）"
-            ),
-        };
-        let bucket = expand(env, &self.objects.bucket)?;
-        if bucket.trim().is_empty() {
-            bail!("objects.bucket must not be empty");
-        }
-        let dir = optional_expanded(env, &self.objects.dir)?;
-        // COS 四个字段在配置文件里**常驻**（不然切模式还得改文件），所以 file 模式下
-        // 它们解析不出来只当「没配」；真选 s3 时再 fail-closed。
-        let cos_required = objects_kind == ObjectsKind::S3;
-        let endpoint = optional_expanded_lax(env, &self.objects.endpoint, cos_required)?;
-        let region = optional_expanded_lax(env, &self.objects.region, cos_required)?;
-        let access_key = optional_expanded_lax(env, &self.objects.access_key, cos_required)?;
-        let secret_key = optional_expanded_lax(env, &self.objects.secret_key, cos_required)?;
-        if objects_kind == ObjectsKind::File && dir.is_none() {
-            // 相对路径相对进程工作目录；容器里给绝对路径（挂载点）。
-            bail!("objects.kind = file requires objects.dir");
-        }
-        if objects_kind == ObjectsKind::S3 {
-            if endpoint.is_none() || region.is_none() {
-                bail!("objects.kind = s3 requires objects.endpoint and objects.region");
+        // 多客户：每个 cell 各自解析（与顶层同口径）；重复的 cust_id 当场拒，
+        // 否则“后一条静默覆盖前一条”会让数据落去意想不到的库。
+        let mut cells: Vec<CellConfig> = Vec::with_capacity(self.storage.cell.len());
+        for raw in &self.storage.cell {
+            let cust_id = expand(env, &raw.cust_id)?.trim().to_string();
+            if cust_id.is_empty() {
+                bail!("[[storage.cell]] cust_id must not be empty");
             }
-            if access_key.is_none() || secret_key.is_none() {
-                bail!("objects.kind = s3 requires objects.access_key and objects.secret_key");
+            if !crate::domain::artifact::is_safe_segment(&cust_id) {
+                bail!("[[storage.cell]] cust_id {cust_id:?} is not a safe key segment");
             }
+            if cells.iter().any(|cell| cell.cust_id == cust_id) {
+                bail!("[[storage.cell]] cust_id {cust_id:?} is declared twice");
+            }
+            cells.push(CellConfig {
+                cust_id: cust_id.clone(),
+                index: resolve_index(
+                    env,
+                    raw.index.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "[[storage.cell]] {cust_id:?} requires [storage.cell.index]"
+                        )
+                    })?,
+                )?,
+                objects: resolve_objects(
+                    env,
+                    raw.objects.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "[[storage.cell]] {cust_id:?} requires [storage.cell.objects]"
+                        )
+                    })?,
+                )?,
+            });
         }
 
         let probe_url = optional_expanded(env, &self.probe.url)?;
@@ -456,25 +543,15 @@ impl RawConfig {
                     _ => None,
                 },
             },
-            index: IndexConfig {
-                kind: index_kind,
-                database_url,
-            },
-            objects: ObjectsConfig {
-                kind: objects_kind,
-                dir,
-                bucket,
-                endpoint,
-                region,
-                access_key,
-                secret_key,
-            },
+            index: index_config,
+            objects: objects_config,
             probe: ProbeConfig {
                 enabled: self.probe.enabled,
                 interval_secs: self.probe.interval_secs,
                 retention_hours: self.probe.retention_hours,
                 url: probe_url,
             },
+            cells,
         })
     }
 }
@@ -843,5 +920,144 @@ mod tests {
         )
         .expect_err("unknown kind must fail");
         assert!(error.to_string().contains("unknown kind"));
+    }
+
+    // ── 多客户：`[[storage.cell]]` ──────────────────────────────────────
+
+    const CELL_BASE: &str = r#"
+        [sink]
+        allowed_kinds = ["investigation_report"]
+        [index]
+        kind = "postgres"
+        database_url = "postgres://default/db"
+        [objects]
+        kind = "file"
+        dir = "/var/lib/wist-evidence/objects"
+    "#;
+
+    #[test]
+    fn cells_are_empty_by_default() {
+        let config = parse(CELL_BASE).expect("minimal config");
+        assert!(
+            config.cells.is_empty(),
+            "不写 [[storage.cell]] 就是一坡单后端（升级无感）"
+        );
+    }
+
+    #[test]
+    fn cells_require_their_own_index_and_objects() {
+        // 每个 cell 必须自带 index/objects：缺了不能静默继承 default，
+        // 否则多个客户会写进同一个库/目录。
+        let error = parse(&format!(
+            r#"
+            {CELL_BASE}
+            [[storage.cell]]
+            cust_id = "1000000000000000001"
+            "#
+        ))
+        .expect_err("cell without index section must fail");
+        assert!(
+            error.to_string().contains("requires [storage.cell.index]"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cell_index_still_needs_a_database_url() {
+        let error = parse(&format!(
+            r#"
+            {CELL_BASE}
+            [[storage.cell]]
+            cust_id = "1000000000000000001"
+            [storage.cell.index]
+            kind = "postgres"
+            [storage.cell.objects]
+            kind = "file"
+            dir = "/tmp/a"
+            "#
+        ))
+        .expect_err("cell postgres without url must fail");
+        assert!(error.to_string().contains("requires index.database_url"));
+    }
+
+    #[test]
+    fn duplicate_cell_cust_id_is_rejected() {
+        // 重复会让“后一条静默覆盖前一条”，数据落去意想不到的库。
+        let error = parse(&format!(
+            r#"
+            {CELL_BASE}
+            [[storage.cell]]
+            cust_id = "1000000000000000001"
+            [storage.cell.index]
+            kind = "memory"
+            [storage.cell.objects]
+            kind = "file"
+            dir = "/tmp/a"
+
+            [[storage.cell]]
+            cust_id = "1000000000000000001"
+            [storage.cell.index]
+            kind = "memory"
+            [storage.cell.objects]
+            kind = "file"
+            dir = "/tmp/b"
+            "#
+        ))
+        .expect_err("duplicate cust_id must fail");
+        assert!(error.to_string().contains("declared twice"));
+    }
+
+    #[test]
+    fn unsafe_cell_cust_id_is_rejected() {
+        // 它同时是对象键的第一段，能路径穿越就完了。
+        let error = parse(&format!(
+            r#"
+            {CELL_BASE}
+            [[storage.cell]]
+            cust_id = "../evil"
+            [storage.cell.index]
+            kind = "memory"
+            [storage.cell.objects]
+            kind = "file"
+            dir = "/tmp/a"
+            "#
+        ))
+        .expect_err("unsafe cust_id must fail");
+        assert!(error.to_string().contains("safe key segment"));
+    }
+
+    #[test]
+    fn a_valid_cell_is_resolved_like_the_top_level_section() {
+        let config = parse(&format!(
+            r#"
+            {CELL_BASE}
+            [[storage.cell]]
+            cust_id = "1000000000000000001"
+            [storage.cell.index]
+            kind = "postgres"
+            database_url = "postgres://cell/db"
+            [storage.cell.objects]
+            kind = "file"
+            dir = "/srv/wist-field/1000000000000000001/objects"
+            "#
+        ))
+        .expect("valid cell");
+        assert_eq!(config.cells.len(), 1);
+        let cell = &config.cells[0];
+        assert_eq!(cell.cust_id, "1000000000000000001");
+        assert_eq!(cell.index.kind, IndexKind::Postgres);
+        assert_eq!(
+            cell.index.database_url.as_deref(),
+            Some("postgres://cell/db")
+        );
+        assert_eq!(
+            cell.objects.dir.as_deref(),
+            Some("/srv/wist-field/1000000000000000001/objects")
+        );
+        // default 不受影响。
+        assert_eq!(
+            config.index.database_url.as_deref(),
+            Some("postgres://default/db")
+        );
     }
 }

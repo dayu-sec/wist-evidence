@@ -1,6 +1,8 @@
+pub mod backends;
 pub mod index;
 pub mod object_store;
 
+pub use backends::{Backend, Backends};
 pub use index::{Index, IndexError, ListFilter, MemoryIndex};
 pub use object_store::{
     FileObjectStore, MemoryObjectStore, ObjectBackend, ObjectMeta, ObjectStore, StoreError,

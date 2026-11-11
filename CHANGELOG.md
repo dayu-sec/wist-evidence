@@ -1,5 +1,19 @@
 # CHANGELOG
 
+## 0.2.0 · 2026-11-11
+
+- **多客户：客户级存储路由（`[[storage.cell]]`）**。一个进程可以同时服务多个客户，
+  每个客户落**独立的 PG 与独立的对象目录**；写入按请求 body 里的 `cust_id` 分流，
+  读按 `x-evidence-tenant` 分流。未登记的 `cust_id` 落 default 并打 WARN（不丢数据）。
+  - 不配 `[[storage.cell]]` 时行为与 0.1.x **完全一致**（单后端），升级无感。
+  - `[[storage.cell]]` 的 `[storage.cell.index]` / `[storage.cell.objects]` 都是**必填**：
+    静默继承 default 会让两个客户写进同一个库，比启动失败难查得多。
+  - 重复的 `cust_id`、路径穿越形态的 `cust_id` 在启动期直接拒。
+  - `/healthz` 多一个 `cells: [cust_id, …]`，现场能一眼看出路由表。
+- 存储后端抽象（`infra::Backends`）替代单 `Index` + `ObjectStore`：
+  `service` 的读写、探针清理都按客户取后端；`EvidenceService::new` 保持原签名（单后端）。
+
+
 ## 0.1.16 · 2026-11-10
 
 - **读端点最小鉴权（`[read] service_token`）**：配了就必须带

@@ -26,12 +26,9 @@ async fn main() -> anyhow::Result<()> {
     let config_path = std::env::args().nth(1);
     let config = Config::load(config_path.as_deref().map(Path::new))?;
 
-    let index = build_index(&config).await?;
-    let objects = build_objects(&config)?;
-    let mut service = EvidenceService::new(
-        index,
-        objects,
-        config.objects.bucket.clone(),
+    let backends = build_backends(&config).await?;
+    let mut service = EvidenceService::with_backends(
+        backends,
         config.sink.allowed_kinds.clone(),
         config.sink.max_body_bytes,
     );
@@ -121,14 +118,47 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn build_index(config: &Config) -> anyhow::Result<Arc<dyn Index>> {
-    match config.index.kind {
+/// 组装存储路由表：`default` 是顶层 `[index]` / `[objects]`，每个 `[[storage.cell]]` 一个后端。
+///
+/// 每个后端的 PG 连接池是**独立**的（`max_connections` 默认 8），所以客户数 × 8 不能超过
+/// PG 实例的 `max_connections` —— 单客户一个 PG 实例时自然满足。
+async fn build_backends(config: &Config) -> anyhow::Result<Arc<wist_evidence::infra::Backends>> {
+    let default = wist_evidence::infra::Backend {
+        index: build_index(&config.index).await?,
+        objects: build_objects(&config.objects)?,
+        bucket: config.objects.bucket.clone(),
+    };
+
+    let mut cells = std::collections::BTreeMap::new();
+    for cell in &config.cells {
+        let backend = wist_evidence::infra::Backend {
+            index: build_index(&cell.index).await?,
+            objects: build_objects(&cell.objects)?,
+            bucket: cell.objects.bucket.clone(),
+        };
+        cells.insert(cell.cust_id.clone(), backend);
+    }
+
+    if !cells.is_empty() {
+        log::info!(
+            "storage: {} customer cell(s) configured, others fall back to the default backend",
+            cells.len()
+        );
+    }
+    Ok(Arc::new(wist_evidence::infra::Backends::new(
+        default, cells,
+    )))
+}
+
+async fn build_index(
+    config: &wist_evidence::config::IndexConfig,
+) -> anyhow::Result<Arc<dyn Index>> {
+    match config.kind {
         IndexKind::Memory => Ok(Arc::new(MemoryIndex::new())),
         IndexKind::Postgres => {
             #[cfg(feature = "pg")]
             {
                 let url = config
-                    .index
                     .database_url
                     .as_deref()
                     .context("index.database_url is required for postgres")?;
@@ -144,11 +174,12 @@ async fn build_index(config: &Config) -> anyhow::Result<Arc<dyn Index>> {
     }
 }
 
-fn build_objects(config: &Config) -> anyhow::Result<Arc<dyn ObjectStore>> {
-    match config.objects.kind {
+fn build_objects(
+    config: &wist_evidence::config::ObjectsConfig,
+) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    match config.kind {
         ObjectsKind::File => {
             let dir = config
-                .objects
                 .dir
                 .as_deref()
                 .context("objects.dir is required for objects.kind = file")?;
@@ -164,11 +195,11 @@ fn build_objects(config: &Config) -> anyhow::Result<Arc<dyn ObjectStore>> {
             #[cfg(feature = "s3")]
             {
                 let s3 = S3Config {
-                    endpoint: config.objects.endpoint.clone().unwrap_or_default(),
-                    bucket: config.objects.bucket.clone(),
-                    region: config.objects.region.clone().unwrap_or_default(),
-                    access_key: config.objects.access_key.clone().unwrap_or_default(),
-                    secret_key: config.objects.secret_key.clone().unwrap_or_default(),
+                    endpoint: config.endpoint.clone().unwrap_or_default(),
+                    bucket: config.bucket.clone(),
+                    region: config.region.clone().unwrap_or_default(),
+                    access_key: config.access_key.clone().unwrap_or_default(),
+                    secret_key: config.secret_key.clone().unwrap_or_default(),
                 };
                 Ok(Arc::new(S3ObjectStore::new(&s3)))
             }

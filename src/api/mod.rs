@@ -82,6 +82,12 @@ fn health_body(service: &EvidenceService) -> serde_json::Value {
         "status": "ok",
         "objects": { "kind": service.objects_backend().as_str() },
     });
+    // 多客户部署：把已登记的客户列出来（不包含 default）。
+    // 现场用它一眼区分“数据落进 default”还是“落进该客户的库”。
+    let backends = service.backends();
+    if backends.is_multi() {
+        body["cells"] = json!(backends.cell_ids());
+    }
     if let Some(probe) = service.probe_status() {
         body["probe"] = serde_json::to_value(probe).unwrap_or(serde_json::Value::Null);
     }
