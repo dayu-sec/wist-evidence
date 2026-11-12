@@ -14,10 +14,7 @@ use serde::Serialize;
 use crate::domain::Artifact;
 use crate::domain::artifact::{Durability, new_artifact_id, object_key};
 use crate::domain::kind::{Kind, RetentionClass, Sensitivity, Verdict};
-use crate::infra::{
-    Backend, Backends, Index, IndexError, ListFilter, ObjectBackend, ObjectMeta, ObjectStore,
-    StoreError,
-};
+use crate::infra::{Backends, IndexError, ListFilter, ObjectMeta, StoreError};
 
 /// 短签名有效期上限（D8）：预签名 URL 是 bearer token，必须短命 + 单对象。
 pub const MAX_PRESIGN_TTL: Duration = Duration::from_secs(60);
@@ -62,6 +59,8 @@ pub enum WriteError {
     KindNotAllowed(&'static str),
     /// 正文超过上限（413）。
     TooLarge,
+    /// 该客户没有在本站点登记 `[[storage.cell]]`（400）：不是临时故障，重试无用。
+    CustomerNotRegistered(String),
     /// 后端失败（5xx）。
     Backend(String),
 }
@@ -112,7 +111,7 @@ pub struct ListPage {
 
 #[derive(Clone)]
 pub struct EvidenceService {
-    /// 客户 → 后端的路由表；未登记的客户走 default（单后端部署就是只有一个 default）。
+    /// 客户 → 后端的路由表；每个客户都必须登记，未登记写 4xx / 读 404。
     backends: Arc<Backends>,
     allowed_kinds: Vec<Kind>,
     max_body_bytes: usize,
@@ -159,26 +158,6 @@ struct PreparedWrite {
 }
 
 impl EvidenceService {
-    /// 单后端构造（未配置 `[[storage.cell]]` 的部署，以及 `new` 的所有调用点）。
-    pub fn new(
-        index: Arc<dyn Index>,
-        objects: Arc<dyn ObjectStore>,
-        bucket: String,
-        allowed_kinds: Vec<Kind>,
-        max_body_bytes: usize,
-    ) -> Self {
-        let backend = Backend {
-            index,
-            objects,
-            bucket,
-        };
-        Self::with_backends(
-            Arc::new(Backends::single(backend)),
-            allowed_kinds,
-            max_body_bytes,
-        )
-    }
-
     /// 多后端构造：客户 → 独立 PG / 对象目录（多客户 data-field）。
     pub fn with_backends(
         backends: Arc<Backends>,
@@ -208,13 +187,6 @@ impl EvidenceService {
         self.probe
             .as_ref()
             .map(|probe| probe.read().expect("probe status poisoned").clone())
-    }
-
-    /// 对象后端类型（自述用）：`/healthz` 的 `objects.kind`，上游据此避开一次无用的签名请求。
-    ///
-    /// 多客户部署下取 **default** 的类型 —— 它代表「未登记客户的落点」，也是升级前的行为。
-    pub fn objects_backend(&self) -> ObjectBackend {
-        self.backends.default().objects.backend()
     }
 
     /// **三字段写入**：`cust_id` / `cmd_id` / `content`（其余维度由调用层按部署配置填好）。
@@ -261,12 +233,12 @@ impl EvidenceService {
         let retention_class = RetentionClass::resolve(w.kind, w.sensitivity)
             .ok_or(WriteError::BadRequest("evidence_retention_undefined"))?;
 
-        // **分流点（多客户）**：写请求里的 `cust_id` 就是客户，它决定这条记录落哪个后端。
-        // 未登记的客户落 default —— 不能拒，否则数据只能进引擎的 rescue。
-        let backend = self.backends.for_tenant(&w.customer_id);
-        if self.backends.is_multi() && !self.backends.has_cell(&w.customer_id) {
-            crate::infra::backends::warn_unregistered(&w.customer_id);
-        }
+        // **分流点**：写请求里的 `cust_id` 就是客户，它决定这条记录落哪个后端。
+        // 未登记的客户没有落点，直接 4xx —— 不能落 fallback，否则数据会静静地进错库。
+        let backend = self
+            .backends
+            .for_tenant(&w.customer_id)
+            .ok_or_else(|| WriteError::CustomerNotRegistered(w.customer_id.clone()))?;
 
         let sha256 = sha256_hex(w.content.as_bytes());
 
@@ -438,7 +410,13 @@ impl EvidenceService {
         }
         let limit = limit.clamp(1, MAX_LIST_LIMIT);
         // **读分流**：租户 = 客户，它决定去哪个库捞（读口本来就带着 `x-evidence-tenant`）。
-        let backend = self.backends.for_tenant(tenant_id);
+        // 未登记租户不泄露存在性：列表就是空的。
+        let Some(backend) = self.backends.for_tenant(tenant_id) else {
+            return Ok(ListPage {
+                artifacts: Vec::new(),
+                next_cursor: None,
+            });
+        };
         let rows = backend
             .index
             .list(tenant_id, filter, limit + 1, cursor)
@@ -480,9 +458,10 @@ impl EvidenceService {
     ) -> Result<(Artifact, Vec<u8>), ReadError> {
         let artifact = self.find_visible(principal, key).await?;
         // 正文跟索引必须读**同一个后端**：按记录自己的租户选，不看调用方。
-        let stored = self
-            .backends
-            .for_tenant(&artifact.tenant_id)
+        let Some(backend) = self.backends.for_tenant(&artifact.tenant_id) else {
+            return Err(ReadError::NotFound);
+        };
+        let stored = backend
             .objects
             .get(&artifact.object_key)
             .await
@@ -517,9 +496,10 @@ impl EvidenceService {
     ) -> Result<PresignOutcome, ReadError> {
         let artifact = self.find_visible(principal, key).await?;
         let ttl = ttl.min(MAX_PRESIGN_TTL);
-        let url = self
-            .backends
-            .for_tenant(&artifact.tenant_id)
+        let Some(backend) = self.backends.for_tenant(&artifact.tenant_id) else {
+            return Err(ReadError::NotFound);
+        };
+        let url = backend
             .objects
             .presign_get(&artifact.object_key, ttl)
             .await
@@ -579,8 +559,10 @@ impl EvidenceService {
             since: None,
         };
         let mut purged = 0u64;
-        // 探针清理也跟客户走：探针写在哪个后端就清哪个后端。
-        let backend = self.backends.for_tenant(tenant_id);
+        // 探针清理也跟客户走：探针写在哪个后端就清哪个后端；未登记客户没有可清的。
+        let Some(backend) = self.backends.for_tenant(tenant_id) else {
+            return Ok(0);
+        };
         loop {
             let rows = backend
                 .index
@@ -631,9 +613,10 @@ impl EvidenceService {
     ) -> Result<Artifact, ReadError> {
         let mut found = None;
         for tenant in &principal.tenant_ids {
-            if let Some(row) = self
-                .backends
-                .for_tenant(tenant)
+            let Some(backend) = self.backends.for_tenant(tenant) else {
+                continue;
+            };
+            if let Some(row) = backend
                 .index
                 .get(tenant, key)
                 .await
@@ -645,9 +628,10 @@ impl EvidenceService {
         }
         if found.is_none() {
             for tenant in &principal.tenant_ids {
-                if let Some(row) = self
-                    .backends
-                    .for_tenant(tenant)
+                let Some(backend) = self.backends.for_tenant(tenant) else {
+                    continue;
+                };
+                if let Some(row) = backend
                     .index
                     .find_by_command(tenant, key)
                     .await

@@ -129,6 +129,15 @@ impl WriteErrorResponse for WriteError {
                 "evidence_body_too_large",
                 "artifact exceeds the configured limit".to_string(),
             ),
+            // 未登记客户没有落点：这是配置/接入错，不是临时故障，重试不会变好。
+            Self::CustomerNotRegistered(cust_id) => (
+                StatusCode::BAD_REQUEST,
+                "evidence_customer_unregistered",
+                format!(
+                    "cust_id {cust_id} has no [[storage.cell]] in this deployment: \
+                     check the cell list and that it matches the gateway-bound tenant_id"
+                ),
+            ),
             // 5xx 是**故意**的：让 sink 重试并最终把失败落成可见的 rescue 文件。
             // 但**细节只进日志**：后端原文里有宿主绝对路径 / errno / 桶名，
             // 不能回给数据面，否则就是一个免费的目录与磁盘状态探测器。

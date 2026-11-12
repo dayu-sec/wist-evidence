@@ -43,6 +43,9 @@ pub struct ListFilter {
 
 #[async_trait]
 pub trait Index: Send + Sync {
+    /// 索引类型（自述用，`/healthz` 的客户清单里会用到）：`memory` / `postgres`。
+    fn kind(&self) -> &'static str;
+
     /// 按唯一键找当前行。`subject_id` 与 `dedupe_key` 都来自**服务端推导**，不取正文自述。
     async fn find_by_dedupe(
         &self,
@@ -117,6 +120,10 @@ impl MemoryIndex {
 
 #[async_trait]
 impl Index for MemoryIndex {
+    fn kind(&self) -> &'static str {
+        "memory"
+    }
+
     async fn find_by_dedupe(
         &self,
         tenant_id: &str,
@@ -359,6 +366,10 @@ mod pg {
 
     #[async_trait]
     impl Index for PgIndex {
+        fn kind(&self) -> &'static str {
+            "postgres"
+        }
+
         async fn find_by_dedupe(
             &self,
             tenant_id: &str,

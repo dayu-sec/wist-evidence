@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## 0.3.0-alpha · 2026-11-12
+
+**不向后兼容**：默认存储后端已移除。旧配置必须把顶层 `[index]` / `[objects]`
+改写成至少一个 `[[storage.cell]]`（每个 cell 自带 `[storage.cell.index]` +
+`[storage.cell.objects]`），否则进程启动直接失败。
+
+- **去掉默认后端**：一个进程只按客户 cell 路由，数据不会再有可能落进“没人用的默认库”。
+  单客户站点也必须显式登记一个 cell（示例见 `wist-evidence.example.toml`）。
+- **未登记客户写请求回 400 `evidence_customer_unregistered`**：不再静默落 fallback，
+  接入方一眼能看出是 cells 清单 / 网关 `tenant_id` 没对上；重试无用，不会进 rescue 反复投。
+- **读路径不泄露存在性**：未登记租户的列表为空、按 key 读 404、探针清理返回 0。
+- **写探针每客户一份**：每个已登记 cell 各探一条，全部成功才算健康；失败日志点名 cust_id。
+  探针清理也按客户逐个扫。
+- **`/healthz` 永远回显客户清单**：`cells: [{cust_id, index, objects}]`（不含连接串 / 口令），
+  `objects.kind` 在客户后端不一致时回 `mixed`，读端据此保守走代理读。
+
 ## 0.2.0 · 2026-11-11
 
 - **多客户：客户级存储路由（`[[storage.cell]]`）**。一个进程可以同时服务多个客户，

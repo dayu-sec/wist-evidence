@@ -17,7 +17,7 @@
 | `GET /internal/evidence/{id}` 元数据读（跨租户/低敏感度 → 404） | ✅ |
 | `POST /internal/evidence/{id}:presign` 短签名（≤ 60s、单对象） | ✅（仅 `s3`） |
 | `GET /internal/evidence/{id}/content` 代理读正文 | ✅ |
-| `GET /healthz` 部署自述（`objects.kind`，上游据此选读正文通路） | ✅ |
+| `GET /healthz` 部署自述（`objects.kind` + 客户 cell 清单） | ✅ |
 | PG 索引 / S3(COS) 对象 | ✅ 代码就绪（`pg` / `s3` feature），**未接真机** |
 | 清理作业、删除凭证、对账、索引重建、前缀级 STS、每客户 CMK | ⬜ P1+ |
 
@@ -84,6 +84,7 @@ Content-Type: application/json
 | 状态 | code | 含义 |
 |---|---|---|
 | 400 | `evidence_record_invalid` / `evidence_body_invalid` / `evidence_subject_invalid` / `evidence_customer_invalid` / `evidence_object_key_invalid` | 参数不对，重试无用 |
+| 400 | `evidence_customer_unregistered` | 该 `cust_id` 没有在本站点登记 `[[storage.cell]]`（检查 cells 清单与网关绑定的 `tenant_id`） |
 | 403 | `evidence_kind_not_allowed` | 部署未开该 kind |
 | 413 | `evidence_body_too_large` | 超过 `[sink].max_body_bytes` |
 | 5xx | `evidence_write_failed` | **只有这类才该重试**（sink 会重试后落 rescue 文件） |
@@ -98,32 +99,68 @@ Content-Type: application/json
 一个连接器（只负责 POST、不做字段映射）+ 一个 sink 分组；只需要 `EVIDENCE_SINK_URL`。
 OML 的输出必须是三字段 `cust_id` / `cmd_id` / `content`。
 
+## 客户存储（`[[storage.cell]]`，必填）
+
+每个客户一套独立的索引 + 对象存储；**没有默认后端**。配置里至少要有
+一条 `[[storage.cell]]`，否则进程启动直接失败——单客户站点也一样。
+
+```toml
+[[storage.cell]]
+cust_id = "c-001"
+
+[storage.cell.index]
+kind = "postgres"
+database_url = "${SEC_EVIDENCE_DB_URL}"
+
+[storage.cell.objects]
+kind = "s3"
+bucket = "wist-evidence-c-001"
+endpoint = "${SEC_COS_ENDPOINT}"
+region = "${SEC_COS_REGION}"
+access_key = "${SEC_COS_SECRET_ID}"
+secret_key = "${SEC_COS_SECRET_KEY}"
+```
+
+- **写**：body 里的 `cust_id` 决定落哪个 cell；未登记客户回 `400`
+  `evidence_customer_unregistered`，**不会**落到别的客户库里。
+- **读**：`x-evidence-tenant` 决定去哪个 cell；未登记租户的列表为空、按 key 读 `404`、
+  探针清理返回 `0`，不泄露“这个客户存不存在”。
+- `/healthz` **永远**回显客户清单（`cust_id` + `index` / `objects` 类型），现场用它核对
+  路由表；清单不含连接串 / 口令。
+
 ## 对象存储：两种模式
 
-正文只有两个落点，**没有「内存」这一档**（正文丢了就再也要不回来，不该成为部署选项）：
+每个 cell 的 `[storage.cell.objects]` 只有两个落点，**没有「内存」这一档**
+（正文丢了就再也要不回来，不该成为部署选项）：
 
-| `objects.kind` | 用在哪 | 落点 | 预签名 |
+| `[storage.cell.objects] kind` | 用在哪 | 落点 | 预签名 |
 |---|---|---|---|
-| `file` | 测试 / 现场验证 | `<objects.dir>/<键>`，元数据在同目录 `<键>.meta.json` | ❌（回 501，正文直接看文件） |
+| `file` | 测试 / 现场验证 | `<dir>/<键>`，元数据在同目录 `<键>.meta.json` | ❌（回 501，正文直接看文件） |
 | `s3` | 生产 | S3 兼容桶（腾讯 COS / MinIO） | ✅ SDK SigV4 |
 
-后端类型对外自述在 `/healthz` 的 `objects.kind` 里（两张监听同一口径）：
+后端类型对外自述在 `/healthz` 的 `objects.kind` 里（两张监听同一口径）；
+`mixed` 表示各客户的 `objects` 类型不同，读端会保守地走代理读：
 
 ```json
-{ "status": "ok", "objects": { "kind": "file" } }
+{
+  "status": "ok",
+  "objects": { "kind": "file" },
+  "cells": [{ "cust_id": "c-001", "index": "memory", "objects": "file" }]
+}
 ```
 
 上游（console BFF / 页面）读这个字段决定正文怎么打开 —— `file` 直接走代理读，
 不必先发一个必然 501 的 `:presign`。字段不认识（老实例）时上游按「先试签名」处理。
 
 ```toml
-# 本地文件（默认；重启不丢，能直接看）
-[objects]
+# 每个 cell 各写一份；单客户最小示例见 wist-evidence.example.toml。
+# 本地文件（重启不丢，能直接看）
+[storage.cell.objects]
 kind = "file"
 dir = "data/objects"
 
 # 腾讯 COS / MinIO
-[objects]
+[storage.cell.objects]
 kind = "s3"
 bucket = "wist-evidence"
 endpoint = "${SEC_COS_ENDPOINT}"
@@ -148,8 +185,9 @@ secret_key = "${SEC_COS_SECRET_KEY}"
 
 ## 写探针（自检）
 
-每 `interval_secs` 往**自己的写端点**投一条探针证据 —— 相当于一个内置的小号 wparse：
-同样的 URL、同样的三字段形状。它验的是整条写链路：路由 → 序列化 → 对象 → 索引。
+每 `interval_secs` 往**自己的写端点**为**每个已登记客户**各投一条探针证据 ——
+相当于一个内置的小号 wparse：同样的 URL、同样的三字段形状。它验的是整条写链路：
+路由 → 序列化 → 对象 → 索引。某个客户写不进去时，日志会点名是哪个 `cust_id`。
 
 ```toml
 [probe]
@@ -160,7 +198,7 @@ retention_hours = 24     # 探针产物活多久
 ```
 
 - 探针产物 `subject_id = "_probe"`，**不出现在证据列表**里（按 id 仍可读）；
-- 过期探针每小时扫一次，先删对象、再删索引行；
+- 过期探针每小时扫一次，**按客户逐个扫**：先删对象、再删索引行；
 - 结果在 `/healthz` 的 `probe` 块里（`last_ok` / `last_at_ms` / `last_latency_ms` /
   `consecutive_failures`），星象台的「接口可用性」页直接展示。
 

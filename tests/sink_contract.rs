@@ -3,6 +3,7 @@
 //! 这些是设计稿 §18 里能在**不接真 COS / 真 PG** 的前提下验的部分；
 //! 真实后端（COS 预签名语义、KMS）留到真机验收。
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Router;
@@ -15,12 +16,14 @@ use tower::ServiceExt;
 use wist_evidence::api::{self, ReadState, SinkState};
 use wist_evidence::domain::Kind;
 use wist_evidence::infra::{
-    FileObjectStore, MemoryIndex, MemoryObjectStore, ObjectBackend, ObjectMeta, ObjectStore,
-    StoreError,
+    Backend, Backends, FileObjectStore, MemoryIndex, MemoryObjectStore, ObjectBackend, ObjectMeta,
+    ObjectStore, StoreError,
 };
 use wist_evidence::service::EvidenceService;
 
 const CUST: &str = "c-001";
+/// harness 把这些客户都登记成 cell：写入与读租户都只在这几个 id 里。
+const CUSTS: [&str; 3] = [CUST, "c-002", "c-003"];
 
 struct Harness {
     sink: Router,
@@ -101,10 +104,22 @@ fn harness_with(
     file: Option<Arc<FileObjectStore>>,
     probe_enabled: bool,
 ) -> Harness {
-    let mut raw_service = EvidenceService::new(
-        index.clone(),
-        objects.clone(),
-        "wist-evidence-test".to_string(),
+    let mut raw_service = EvidenceService::with_backends(
+        Arc::new(Backends::new(
+            CUSTS
+                .iter()
+                .map(|cust_id| {
+                    (
+                        cust_id.to_string(),
+                        Backend {
+                            index: index.clone(),
+                            objects: objects.clone(),
+                            bucket: "wist-evidence-test".to_string(),
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        )),
         vec![Kind::InvestigationReport],
         4 * 1024 * 1024,
     );
@@ -383,6 +398,24 @@ async fn missing_fields_are_400() {
         let (status, body) = post_record(&h.sink, broken.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{broken} -> {body}");
     }
+    assert_eq!(h.object_count(), 0);
+}
+
+#[tokio::test]
+async fn unregistered_customer_is_400() {
+    let h = harness();
+    let mut record = record("cmd-unregistered", "ok");
+    record["cust_id"] = json!("c-missing");
+
+    let (status, body) = post_record(&h.sink, record).await;
+
+    // 没有默认后端：未登记客户是 4xx（重试无用），不能落 fallback 也不是 5xx。
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["code"], "evidence_customer_unregistered",
+        "{body}"
+    );
+    assert_eq!(h.index.len(), 0, "未登记客户不能落进任何客户的库");
     assert_eq!(h.object_count(), 0);
 }
 
@@ -902,6 +935,19 @@ async fn spawn_router(router: Router) -> std::net::SocketAddr {
     address
 }
 
+fn probe_customers() -> Vec<String> {
+    CUSTS.iter().map(|cust| cust.to_string()).collect()
+}
+
+/// 清理也按客户逐个扫（与 `ProbeRunner::purge_expired` 同一口径）。
+async fn purge_all(service: &EvidenceService, retention: std::time::Duration) -> u64 {
+    let mut total = 0;
+    for cust in CUSTS {
+        total += service.purge_probes(cust, retention).await.expect("purge");
+    }
+    total
+}
+
 async fn probe_runner(h: &Harness) -> ProbeRunner {
     let address = spawn_router(h.sink.clone()).await;
     ProbeRunner::new(
@@ -909,7 +955,7 @@ async fn probe_runner(h: &Harness) -> ProbeRunner {
         ProbeTarget {
             url: format!("http://{address}/internal/evidence"),
         },
-        wist_evidence::probe::PROBE_CUSTOMER,
+        probe_customers(),
         std::time::Duration::from_secs(300),
         std::time::Duration::from_secs(24 * 3600),
     )
@@ -928,7 +974,7 @@ async fn unreachable_probe_runner(h: &Harness) -> ProbeRunner {
         ProbeTarget {
             url: format!("http://{address}/internal/evidence"),
         },
-        wist_evidence::probe::PROBE_CUSTOMER,
+        probe_customers(),
         std::time::Duration::from_secs(300),
         std::time::Duration::from_secs(24 * 3600),
     )
@@ -945,25 +991,30 @@ async fn get_healthz(router: &Router) -> Value {
 }
 
 #[tokio::test]
-async fn probe_writes_through_the_http_sink() {
+async fn probe_writes_one_record_per_customer() {
     let h = probe_harness();
     let runner = probe_runner(&h).await;
 
     runner.tick().await.expect("probe should be accepted");
 
-    // 真走了一遍 HTTP：路由、序列化、对象与索引都验了。
-    let row = h
+    // 真走了一遍 HTTP：每个已登记客户各一条，路由、序列化、对象与索引都验了。
+    let rows: Vec<_> = h
         .index
         .all()
         .into_iter()
-        .find(|row| row.subject_id == "_probe")
-        .expect("probe row");
+        .filter(|row| row.subject_id == "_probe")
+        .collect();
+    assert_eq!(rows.len(), CUSTS.len(), "每个客户各投一条探针");
+    let mut customers: Vec<&str> = rows.iter().map(|row| row.customer_id.as_str()).collect();
+    customers.sort_unstable();
+    assert_eq!(customers, CUSTS);
+
+    let row = &rows[0];
     assert_eq!(row.kind, Kind::InvestigationReport);
     // 三字段形状没带敏感度 → 取部署默认（paths）。
     assert_eq!(row.sensitivity.as_str(), "paths");
-    assert_eq!(row.customer_id, "c-probe");
     assert_eq!(row.subject_type, "customer");
-    assert_eq!(h.object_count(), 1);
+    assert_eq!(h.object_count(), CUSTS.len());
 
     let status = h.service.probe_status().expect("probe status");
     assert_eq!(status.last_ok, Some(true));
@@ -998,32 +1049,19 @@ async fn repeated_probes_accumulate_until_purged() {
     for _ in 0..3 {
         runner.tick().await.expect("probe");
     }
-    // 每次都是新对象（真实的写入不会覆盖历史）—— 所以必须有每日清理。
-    assert_eq!(h.index.len(), 3);
-    assert_eq!(h.object_count(), 3);
+    // 每拍每个客户各一条，且每次都是新对象（真实的写入不会覆盖历史）—— 所以必须有每日清理。
+    let expected = 3 * CUSTS.len();
+    assert_eq!(h.index.len(), expected);
+    assert_eq!(h.object_count(), expected);
 
     // 保留 1 小时：还新鲜，一条都不删。
-    let purged = h
-        .service
-        .purge_probes(
-            wist_evidence::probe::PROBE_CUSTOMER,
-            std::time::Duration::from_secs(3600),
-        )
-        .await
-        .expect("purge");
+    let purged = purge_all(&h.service, std::time::Duration::from_secs(3600)).await;
     assert_eq!(purged, 0);
-    assert_eq!(h.index.len(), 3);
+    assert_eq!(h.index.len(), expected);
 
     // 保留 0：刚写的也算过期 → 全清（对象一起没）。
-    let purged = h
-        .service
-        .purge_probes(
-            wist_evidence::probe::PROBE_CUSTOMER,
-            std::time::Duration::ZERO,
-        )
-        .await
-        .expect("purge");
-    assert_eq!(purged, 3);
+    let purged = purge_all(&h.service, std::time::Duration::ZERO).await;
+    assert_eq!(purged, expected as u64);
     assert_eq!(h.index.len(), 0);
     assert_eq!(h.object_count(), 0);
 }
@@ -1036,16 +1074,9 @@ async fn purge_only_touches_probes() {
     post_record(&h.sink, record("cmd-real-1", "warn")).await;
     runner.tick().await.expect("probe");
 
-    let purged = h
-        .service
-        .purge_probes(
-            wist_evidence::probe::PROBE_CUSTOMER,
-            std::time::Duration::ZERO,
-        )
-        .await
-        .expect("purge");
+    let purged = purge_all(&h.service, std::time::Duration::ZERO).await;
 
-    assert_eq!(purged, 1, "only the probe may be purged");
+    assert_eq!(purged, CUSTS.len() as u64, "only the probes may be purged");
     assert_eq!(h.index.len(), 1);
     assert_eq!(
         h.index
@@ -1099,7 +1130,7 @@ async fn healthz_has_no_probe_block_when_disabled() {
     assert!(body.get("probe").is_none(), "{body}");
 }
 
-/// `/healthz` 必须自述对象后端：console 据此直接走代理读，不再先撞一次 501。
+/// `/healthz` 必须自述对象后端，并且永远回显客户清单（没有默认后端后清单是唯一的路由表）。
 #[tokio::test]
 async fn healthz_reports_the_object_backend() {
     let dir = std::env::temp_dir().join(format!("wist-evidence-healthz-{}", std::process::id()));
@@ -1116,6 +1147,25 @@ async fn healthz_reports_the_object_backend() {
     assert_eq!(body["objects"]["kind"], "memory", "{body}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn healthz_always_lists_registered_cells() {
+    let h = harness();
+    for router in [&h.sink, &h.read] {
+        let body = get_healthz(router).await;
+        let cells = body["cells"].as_array().unwrap_or_else(|| panic!("{body}"));
+        assert_eq!(cells.len(), CUSTS.len(), "{body}");
+        for (cell, cust_id) in cells.iter().zip(CUSTS) {
+            assert_eq!(cell["cust_id"], cust_id, "{body}");
+            assert_eq!(cell["index"], "memory", "{body}");
+            assert_eq!(cell["objects"], "memory", "{body}");
+            // 清单只用于自述路由，不能带连接串 / 口令。
+            for leaked in ["database_url", "access_key", "secret_key", "endpoint"] {
+                assert!(cell.get(leaked).is_none(), "{leaked} leaked: {body}");
+            }
+        }
+    }
 }
 
 // ── 三字段形状：cust_id / cmd_id / content ──────────────────────────────────

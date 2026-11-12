@@ -25,16 +25,14 @@ pub const HARD_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 pub struct Config {
     pub sink: SinkConfig,
     pub read: ReadConfig,
-    pub index: IndexConfig,
-    pub objects: ObjectsConfig,
     pub probe: ProbeConfig,
-    /// 多客户：客户 id → 独立后端。**空 = 单后端部署**（行为与旧版完全一致）。
+    /// 客户 id → 独立后端。**至少一条**：没有默认后端，未登记的客户会被拒绝。
     pub cells: Vec<CellConfig>,
 }
 
 /// 一个客户的专属后端（`[[storage.cell]]`）。
 ///
-/// `index` / `objects` 的字段含义与顶层同名段一致，只是各自指向独立的 PG / 对象目录。
+/// 每个客户自带一套 PG / 对象目录：默认后端已经移除，单客户站点也必须显式登记。
 #[derive(Debug, Clone)]
 pub struct CellConfig {
     /// 与写入 body 的 `cust_id` 完全一致（也是读口的 `x-evidence-tenant`）。
@@ -180,12 +178,8 @@ struct RawConfig {
     #[serde(default)]
     read: RawRead,
     #[serde(default)]
-    index: RawIndex,
-    #[serde(default)]
-    objects: RawObjects,
-    #[serde(default)]
     probe: RawProbe,
-    /// 多客户路由表（`[[storage.cell]]`）。不写就是一坡单后端。
+    /// 客户路由表（`[[storage.cell]]`）。**必填且至少一条**。
     #[serde(default)]
     storage: RawStorage,
 }
@@ -367,7 +361,7 @@ fn default_bucket() -> String {
     "wist-evidence-dev".to_string()
 }
 
-/// 解析一个 `[index]` 段（顶层与 `[[storage.cell]]` 共用同一口径）。
+/// 解析一个 `[storage.cell.index]` 段。
 fn resolve_index(env: &EnvDict, raw: &RawIndex) -> anyhow::Result<IndexConfig> {
     let kind = match raw.kind.trim() {
         "memory" => IndexKind::Memory,
@@ -385,7 +379,7 @@ fn resolve_index(env: &EnvDict, raw: &RawIndex) -> anyhow::Result<IndexConfig> {
     Ok(IndexConfig { kind, database_url })
 }
 
-/// 解析一个 `[objects]` 段（顶层与 `[[storage.cell]]` 共用同一口径）。
+/// 解析一个 `[storage.cell.objects]` 段。
 fn resolve_objects(env: &EnvDict, raw: &RawObjects) -> anyhow::Result<ObjectsConfig> {
     // 存储后端也由环境变量选（`EVIDENCE_STORE_KIND=file|s3`）：切换模式不需要改配置文件。
     let raw_kind = expand(env, &raw.kind)?;
@@ -476,10 +470,16 @@ impl RawConfig {
             );
         }
 
-        let index_config = resolve_index(env, &self.index)?;
-        let objects_config = resolve_objects(env, &self.objects)?;
+        // 没有默认后端：零个 cell 意味着任何写入都无处可去，只能在启动期直接拒绝。
+        if self.storage.cell.is_empty() {
+            bail!(
+                "no [[storage.cell]] configured: the default backend was removed in 0.3.0 — \
+                 every deployment registers at least one customer cell \
+                 (each cell carries its own [storage.cell.index] + [storage.cell.objects])"
+            );
+        }
 
-        // 多客户：每个 cell 各自解析（与顶层同口径）；重复的 cust_id 当场拒，
+        // 每个 cell 各自解析；重复的 cust_id 当场拒，
         // 否则“后一条静默覆盖前一条”会让数据落去意想不到的库。
         let mut cells: Vec<CellConfig> = Vec::with_capacity(self.storage.cell.len());
         for raw in &self.storage.cell {
@@ -543,8 +543,6 @@ impl RawConfig {
                     _ => None,
                 },
             },
-            index: index_config,
-            objects: objects_config,
             probe: ProbeConfig {
                 enabled: self.probe.enabled,
                 interval_secs: self.probe.interval_secs,
@@ -565,7 +563,7 @@ fn optional_expanded(env: &EnvDict, value: &str) -> anyhow::Result<Option<String
 
 /// 可选字段的宽容版：解析不出来时，`required` 为真才报错，否则当成「没配」。
 ///
-/// 用于 `[objects]` 里常驻的 COS 四字段：本地文件模式下不该逼着部署方
+/// 用于 `[storage.cell.objects]` 里常驻的 COS 四字段：本地文件模式下不该逼着部署方
 /// 去定义一堆用不到的 COS 凭据，但真选了 `kind = s3` 就必须 fail-closed。
 fn optional_expanded_lax(
     env: &EnvDict,
@@ -597,13 +595,47 @@ mod tests {
         raw.resolve(&EnvDict::new())
     }
 
+    /// 单客户最小配置：0.3.0 起每个部署都必须登记至少一个 cell。
+    const MIN_CELL: &str = r#"
+        [[storage.cell]]
+        cust_id = "c-001"
+        [storage.cell.index]
+        kind = "memory"
+        [storage.cell.objects]
+        kind = "file"
+        dir = "data/objects"
+    "#;
+
+    /// 只替换 cell 的 `[storage.cell.objects]` 段，保留客户与索引的默认形状。
+    fn with_cell_objects(objects: &str) -> String {
+        format!(
+            r#"
+            [[storage.cell]]
+            cust_id = "c-001"
+            [storage.cell.index]
+            kind = "memory"
+            [storage.cell.objects]
+            {objects}
+            "#
+        )
+    }
+
+    fn with_cell_index(index: &str, objects: &str) -> String {
+        format!(
+            r#"
+            [[storage.cell]]
+            cust_id = "c-001"
+            [storage.cell.index]
+            {index}
+            [storage.cell.objects]
+            {objects}
+            "#
+        )
+    }
+
     #[test]
     fn probe_defaults_are_off() {
-        let config = parse(
-            r#"
-            "#,
-        )
-        .expect("minimal config");
+        let config = parse(MIN_CELL).expect("minimal config");
         assert!(!config.probe.enabled, "probe must be opt-in");
         assert_eq!(config.probe.interval_secs, 300);
         assert_eq!(config.probe.retention_hours, 24);
@@ -611,13 +643,14 @@ mod tests {
 
     #[test]
     fn enabled_probe_rejects_zero_interval() {
-        let error = parse(
+        let error = parse(&format!(
             r#"
+            {MIN_CELL}
             [probe]
             enabled = true
             interval_secs = 0
-            "#,
-        )
+            "#
+        ))
         .expect_err("zero interval must fail");
         assert!(error.to_string().contains("probe.interval_secs"));
     }
@@ -625,13 +658,14 @@ mod tests {
     #[test]
     fn enabled_probe_rejects_zero_retention() {
         // 0 会让清理变成「每轮删刚写的东西」。
-        let error = parse(
+        let error = parse(&format!(
             r#"
+            {MIN_CELL}
             [probe]
             enabled = true
             retention_hours = 0
-            "#,
-        )
+            "#
+        ))
         .expect_err("zero retention must fail");
         assert!(error.to_string().contains("probe.retention_hours"));
     }
@@ -652,9 +686,8 @@ mod tests {
         env.insert("SEC_COS_REGION", ValueType::from("ap-shanghai"));
         env.insert("SEC_COS_SECRET_ID", ValueType::from("id"));
         env.insert("SEC_COS_SECRET_KEY", ValueType::from("key"));
-        let raw: RawConfig = toml::from_str(
+        let raw: RawConfig = toml::from_str(&with_cell_objects(
             r#"
-            [objects]
             kind = "${EVIDENCE_STORE_KIND}"
             bucket = "${EVIDENCE_OBJECTS_BUCKET}"
             endpoint = "${SEC_COS_ENDPOINT}"
@@ -662,26 +695,26 @@ mod tests {
             access_key = "${SEC_COS_SECRET_ID}"
             secret_key = "${SEC_COS_SECRET_KEY}"
             "#,
-        )
+        ))
         .expect("toml");
         let config = raw.resolve(&env).expect("s3 should resolve from env");
-        assert_eq!(config.objects.kind, ObjectsKind::S3);
-        assert_eq!(config.objects.bucket, "wist-evidence-1250000000");
+        let objects = &config.cells[0].objects;
+        assert_eq!(objects.kind, ObjectsKind::S3);
+        assert_eq!(objects.bucket, "wist-evidence-1250000000");
         assert_eq!(
-            config.objects.endpoint.as_deref(),
+            objects.endpoint.as_deref(),
             Some("https://cos.ap-shanghai.myqcloud.com")
         );
     }
 
     #[test]
     fn cos_placeholders_are_ignored_in_file_mode() {
-        // `[objects]` 里常驻着 COS 的四个 `${SEC_...}`：file 模式下没人定义它们，
+        // `[storage.cell.objects]` 里常驻着 COS 的四个 `${SEC_...}`：file 模式下没人定义它们，
         // 不应该因此起不来。
         let mut env = EnvDict::new();
         env.insert("EVIDENCE_STORE_KIND", ValueType::from("file"));
-        let raw: RawConfig = toml::from_str(
+        let raw: RawConfig = toml::from_str(&with_cell_objects(
             r#"
-            [objects]
             kind = "${EVIDENCE_STORE_KIND}"
             dir = "/var/lib/wist-evidence/objects"
             endpoint = "${SEC_COS_ENDPOINT}"
@@ -689,30 +722,30 @@ mod tests {
             access_key = "${SEC_COS_SECRET_ID}"
             secret_key = "${SEC_COS_SECRET_KEY}"
             "#,
-        )
+        ))
         .expect("toml");
         let config = raw
             .resolve(&env)
             .expect("file mode must not need COS creds");
-        assert_eq!(config.objects.kind, ObjectsKind::File);
-        assert!(config.objects.endpoint.is_none());
-        assert!(config.objects.access_key.is_none());
+        let objects = &config.cells[0].objects;
+        assert_eq!(objects.kind, ObjectsKind::File);
+        assert!(objects.endpoint.is_none());
+        assert!(objects.access_key.is_none());
     }
 
     #[test]
     fn cos_placeholders_are_required_in_s3_mode() {
         let mut env = EnvDict::new();
         env.insert("EVIDENCE_STORE_KIND", ValueType::from("s3"));
-        let raw: RawConfig = toml::from_str(
+        let raw: RawConfig = toml::from_str(&with_cell_objects(
             r#"
-            [objects]
             kind = "${EVIDENCE_STORE_KIND}"
             endpoint = "${SEC_COS_ENDPOINT}"
             region = "ap-shanghai"
             access_key = "id"
             secret_key = "key"
             "#,
-        )
+        ))
         .expect("toml");
         let error = raw.resolve(&env).expect_err("s3 must fail closed");
         assert!(
@@ -727,12 +760,11 @@ mod tests {
     #[test]
     fn unresolved_store_kind_is_rejected() {
         // 栈级变量没传进来时不能静默退回某个后端。
-        let error = parse(
+        let error = parse(&with_cell_objects(
             r#"
-            [objects]
             kind = "${EVIDENCE_STORE_KIND}"
             "#,
-        )
+        ))
         .expect_err("unresolved kind must fail");
         assert!(
             error
@@ -748,14 +780,15 @@ mod tests {
         let mut env = EnvDict::new();
         env.insert("EVIDENCE_READ_PORT", ValueType::from("9443"));
         env.insert("EVIDENCE_SINK_PORT", ValueType::from("9080"));
-        let raw: RawConfig = toml::from_str(
+        let raw: RawConfig = toml::from_str(&format!(
             r#"
             [sink]
-            listen_addr = "0.0.0.0:${EVIDENCE_SINK_PORT}"
+            listen_addr = "0.0.0.0:${{EVIDENCE_SINK_PORT}}"
             [read]
-            listen_addr = "0.0.0.0:${EVIDENCE_READ_PORT}"
-            "#,
-        )
+            listen_addr = "0.0.0.0:${{EVIDENCE_READ_PORT}}"
+            {MIN_CELL}
+            "#
+        ))
         .expect("toml");
         let config = raw.resolve(&env).expect("listen addrs should expand");
         assert_eq!(config.sink.listen_addr, "0.0.0.0:9080");
@@ -764,12 +797,13 @@ mod tests {
 
     #[test]
     fn unresolved_listen_addr_is_rejected() {
-        let error = parse(
+        let error = parse(&format!(
             r#"
             [read]
-            listen_addr = "0.0.0.0:${EVIDENCE_READ_PORT}"
-            "#,
-        )
+            listen_addr = "0.0.0.0:${{EVIDENCE_READ_PORT}}"
+            {MIN_CELL}
+            "#
+        ))
         .expect_err("unresolved port must not become a literal bind address");
         assert!(
             error
@@ -781,69 +815,63 @@ mod tests {
 
     #[test]
     fn defaults_are_dev_safe() {
-        let config = parse(
-            r#"
-            "#,
-        )
-        .expect("dev config should parse");
-        assert_eq!(config.index.kind, IndexKind::Memory);
+        let config = parse(MIN_CELL).expect("dev config should parse");
+        assert_eq!(config.cells.len(), 1);
+        let cell = &config.cells[0];
+        assert_eq!(cell.index.kind, IndexKind::Memory);
         // 没有「内存对象存储」这一档：默认就是本地目录，重启不丢。
-        assert_eq!(config.objects.kind, ObjectsKind::File);
-        assert_eq!(config.objects.dir.as_deref(), Some("data/objects"));
+        assert_eq!(cell.objects.kind, ObjectsKind::File);
+        assert_eq!(cell.objects.dir.as_deref(), Some("data/objects"));
         assert_eq!(config.sink.allowed_kinds, vec![Kind::InvestigationReport]);
         assert_eq!(config.sink.default_kind, Kind::InvestigationReport);
     }
 
     #[test]
     fn file_objects_require_a_directory() {
-        let error = parse(
+        let error = parse(&with_cell_objects(
             r#"
-            [objects]
             kind = "file"
             dir = ""
             "#,
-        )
+        ))
         .expect_err("file without dir must fail");
         assert!(error.to_string().contains("requires objects.dir"));
     }
 
     #[test]
     fn s3_objects_require_credentials() {
-        let error = parse(
+        let error = parse(&with_cell_objects(
             r#"
-            [objects]
             kind = "s3"
             endpoint = "https://cos.ap-shanghai.myqcloud.com"
             region = "ap-shanghai"
             "#,
-        )
+        ))
         .expect_err("s3 without keys must fail");
         assert!(error.to_string().contains("objects.access_key"));
     }
 
     #[test]
     fn blank_objects_dir_is_rejected() {
-        let error = parse(
+        let error = parse(&with_cell_objects(
             r#"
-            [objects]
             kind = "file"
             dir = "   "
             "#,
-        )
+        ))
         .expect_err("blank dir must fail");
         assert!(error.to_string().contains("requires objects.dir"));
     }
 
     #[test]
     fn s3_objects_require_endpoint_and_region() {
-        let error = parse(
+        let error = parse(&with_cell_objects(
             r#"
-            [objects]
             kind = "s3"
             access_key = "id"
             secret_key = "key"
             "#,
-        )
+        ))
         .expect_err("s3 without endpoint must fail");
         assert!(
             error
@@ -855,9 +883,8 @@ mod tests {
     #[test]
     fn empty_bucket_is_rejected() {
         for kind in ["file", "s3"] {
-            let error = parse(&format!(
+            let error = parse(&with_cell_objects(&format!(
                 r#"
-                [objects]
                 kind = "{kind}"
                 bucket = ""
                 endpoint = "https://cos.example.com"
@@ -865,7 +892,7 @@ mod tests {
                 access_key = "id"
                 secret_key = "key"
                 "#
-            ))
+            )))
             .expect_err("empty bucket must fail");
             assert!(error.to_string().contains("objects.bucket"));
         }
@@ -874,80 +901,82 @@ mod tests {
     #[test]
     fn objects_dir_is_kept_verbatim() {
         // 库里的路径决定数据落点：配置层不做任何规范化（不补斜杠、不 trim）。
-        let config = parse(
+        let config = parse(&with_cell_objects(
             r#"
-            [objects]
             kind = "file"
             dir = "./data/objects"
             "#,
-        )
+        ))
         .expect("relative dir is allowed");
-        assert_eq!(config.objects.dir.as_deref(), Some("./data/objects"));
+        assert_eq!(
+            config.cells[0].objects.dir.as_deref(),
+            Some("./data/objects")
+        );
     }
 
     #[test]
     fn unknown_objects_kind_is_rejected() {
-        let error = parse(
+        let error = parse(&with_cell_objects(
             r#"
-            [objects]
             kind = "memory"
             "#,
-        )
+        ))
         .expect_err("memory is no longer a deployable kind");
         assert!(error.to_string().contains("file|s3"));
     }
 
     #[test]
     fn postgres_without_url_is_rejected() {
-        let error = parse(
+        let error = parse(&with_cell_index(
+            r#"kind = "postgres""#,
             r#"
-            [index]
-            kind = "postgres"
+            kind = "file"
+            dir = "/tmp/a"
             "#,
-        )
+        ))
         .expect_err("postgres without url must fail");
         assert!(error.to_string().contains("requires index.database_url"));
     }
 
     #[test]
     fn unknown_kind_is_rejected() {
-        let error = parse(
+        let error = parse(&format!(
             r#"
             [sink]
             allowed_kinds = ["mystery_report"]
-
-            "#,
-        )
+            {MIN_CELL}
+            "#
+        ))
         .expect_err("unknown kind must fail");
         assert!(error.to_string().contains("unknown kind"));
     }
 
-    // ── 多客户：`[[storage.cell]]` ──────────────────────────────────────
+    // ── 客户存储：`[[storage.cell]]` 必填 ───────────────────────────────
 
     const CELL_BASE: &str = r#"
         [sink]
         allowed_kinds = ["investigation_report"]
-        [index]
-        kind = "postgres"
-        database_url = "postgres://default/db"
-        [objects]
-        kind = "file"
-        dir = "/var/lib/wist-evidence/objects"
     "#;
 
     #[test]
-    fn cells_are_empty_by_default() {
-        let config = parse(CELL_BASE).expect("minimal config");
+    fn missing_cells_is_rejected() {
+        // 默认后端已移除：没有 cell 时任何写入都无处可去，启动必须失败。
+        let error = parse(CELL_BASE).expect_err("zero cells must fail");
         assert!(
-            config.cells.is_empty(),
-            "不写 [[storage.cell]] 就是一坡单后端（升级无感）"
+            error.to_string().contains("no [[storage.cell]] configured"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("the default backend was removed in 0.3.0"),
+            "{error}"
         );
     }
 
     #[test]
     fn cells_require_their_own_index_and_objects() {
-        // 每个 cell 必须自带 index/objects：缺了不能静默继承 default，
-        // 否则多个客户会写进同一个库/目录。
+        // 每个 cell 必须自带 index/objects：缺了不能静默继承，否则多个客户会写进同一个库/目录。
         let error = parse(&format!(
             r#"
             {CELL_BASE}
@@ -1027,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_cell_is_resolved_like_the_top_level_section() {
+    fn a_valid_cell_resolves_its_own_index_and_objects() {
         let config = parse(&format!(
             r#"
             {CELL_BASE}
@@ -1053,11 +1082,6 @@ mod tests {
         assert_eq!(
             cell.objects.dir.as_deref(),
             Some("/srv/wist-field/1000000000000000001/objects")
-        );
-        // default 不受影响。
-        assert_eq!(
-            config.index.database_url.as_deref(),
-            Some("postgres://default/db")
         );
     }
 }

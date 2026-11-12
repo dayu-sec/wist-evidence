@@ -53,11 +53,10 @@ async fn main() -> anyhow::Result<()> {
     let read_app = api::read_router(read_state);
 
     log::info!(
-        "wist-evidence starting: sink={} read={} index={:?} objects={:?} kinds={:?} probe={}",
+        "wist-evidence starting: sink={} read={} cells={} kinds={:?} probe={}",
         config.sink.listen_addr,
         config.read.listen_addr,
-        config.index.kind,
-        config.objects.kind,
+        config.cells.len(),
         config.sink.allowed_kinds,
         if config.probe.enabled {
             format!(
@@ -68,6 +67,16 @@ async fn main() -> anyhow::Result<()> {
             "off".to_string()
         }
     );
+    // 没有默认后端：启动时把客户清单和各自的后端类型摆出来，现场核对“这个 cust_id 登记没”。
+    for cell in &config.cells {
+        log::info!(
+            "storage cell cust_id={} index={:?} objects={:?} bucket={}",
+            cell.cust_id,
+            cell.index.kind,
+            cell.objects.kind,
+            cell.objects.bucket
+        );
+    }
 
     if config.read.service_token.is_none() {
         log::warn!(
@@ -96,9 +105,15 @@ async fn main() -> anyhow::Result<()> {
 
     // 探针必须在两张监听都起来之后再启动：第一拍是立即执行的，抢跑只会记一次假失败。
     if config.probe.enabled {
+        // 每个已登记客户各探一条：默认后端已移除，只探一个保留客户证明不了整条路由。
+        let probe_customers: Vec<String> = config
+            .cells
+            .iter()
+            .map(|cell| cell.cust_id.clone())
+            .collect();
         spawn_probe(
             service.clone(),
-            probe::PROBE_CUSTOMER.to_string(),
+            probe_customers,
             // 探针打的是自己的写端点：默认由 sink 监听地址推回环 URL，
             // 需要时可用 `[probe] url` 覆盖（例如前面有反代）。
             config
@@ -118,17 +133,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 组装存储路由表：`default` 是顶层 `[index]` / `[objects]`，每个 `[[storage.cell]]` 一个后端。
+/// 组装存储路由表：每个 `[[storage.cell]]` 一个后端，**没有默认后端**。
 ///
 /// 每个后端的 PG 连接池是**独立**的（`max_connections` 默认 8），所以客户数 × 8 不能超过
 /// PG 实例的 `max_connections` —— 单客户一个 PG 实例时自然满足。
 async fn build_backends(config: &Config) -> anyhow::Result<Arc<wist_evidence::infra::Backends>> {
-    let default = wist_evidence::infra::Backend {
-        index: build_index(&config.index).await?,
-        objects: build_objects(&config.objects)?,
-        bucket: config.objects.bucket.clone(),
-    };
-
     let mut cells = std::collections::BTreeMap::new();
     for cell in &config.cells {
         let backend = wist_evidence::infra::Backend {
@@ -139,15 +148,8 @@ async fn build_backends(config: &Config) -> anyhow::Result<Arc<wist_evidence::in
         cells.insert(cell.cust_id.clone(), backend);
     }
 
-    if !cells.is_empty() {
-        log::info!(
-            "storage: {} customer cell(s) configured, others fall back to the default backend",
-            cells.len()
-        );
-    }
-    Ok(Arc::new(wist_evidence::infra::Backends::new(
-        default, cells,
-    )))
+    log::info!("storage: {} customer cell(s) configured", cells.len());
+    Ok(Arc::new(wist_evidence::infra::Backends::new(cells)))
 }
 
 async fn build_index(
@@ -221,17 +223,11 @@ async fn shutdown_signal() {
 /// 失败只记日志，不拖垮进程 —— 结果反映在 `/healthz` 的 `probe` 块里。
 fn spawn_probe(
     service: Arc<EvidenceService>,
-    customer_id: String,
+    customers: Vec<String>,
     url: String,
     interval: Duration,
     retention: Duration,
 ) {
-    let runner = ProbeRunner::new(
-        service,
-        ProbeTarget { url },
-        customer_id,
-        interval,
-        retention,
-    );
+    let runner = ProbeRunner::new(service, ProbeTarget { url }, customers, interval, retention);
     tokio::spawn(runner.run());
 }

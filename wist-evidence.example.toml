@@ -25,15 +25,21 @@ listen_addr = "127.0.0.1:19174"
 # 不配 = 保持旧行为（身份头是调用方自述，只靠网络隔离），启动日志会 warn。
 # service_token = "${SEC_EVIDENCE_READ_TOKEN}"
 
-# ── 索引 ─────────────────────────────────────────────────────────────────────
-[index]
+# ── 客户存储（必填，至少一条）──────────────────────────────
+# 每个客户一套独立索引 + 独立对象目录：**没有默认后端**。
+# 未在下面登记的 `cust_id` 写入会回 400（evidence_customer_unregistered）。
+#
+# 单客户站点也要显式登记一个 cell；多客户就重复整段 `[[storage.cell]]`。
+[[storage.cell]]
+cust_id = "c-001"
+
+[storage.cell.index]
 kind = "memory" # memory | postgres
 # database_url = "${SEC_EVIDENCE_DB_URL}"
 
-# ── 对象存储：只有两种模式 ─────────────────────────────────────────────────
-# file：本地目录（默认；测试与现场验证用，重启不丢、能直接看文件）—— 不支持预签名。
-# s3  ：S3 兼容（腾讯 COS / MinIO），生产用，支持短签名 URL。
-[objects]
+# 对象存储：file（本地目录，测试与现场验证用，重启不丢、能直接看文件，不支持预签名）
+# 或 s3（S3 兼容：腾讯 COS / MinIO，生产用，支持短签名 URL）。
+[storage.cell.objects]
 kind = "file"
 dir = "data/objects"
 bucket = "wist-evidence-dev"

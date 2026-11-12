@@ -75,19 +75,17 @@ async fn read_healthz(State(state): State<ReadState>) -> Json<serde_json::Value>
 /// 两张监听共用：进程活着就是 `status = ok`；开了写探针时多一个 `probe` 块，
 /// 让上游能区分「端口能连上」与「真的能写进去」。
 ///
-/// `objects.kind` 是**部署自述**：读端据此判断正文怎么打开（`s3` = 签名 URL，
-/// `file` = 只能代理读），不必先发一个必然 501 的 `:presign`。
+/// `objects.kind` 是**部署自述**：所有客户后端一致时就是那个类型，`mixed` 表示各客户不同；
+/// 读端据此判断正文怎么打开（`s3` = 签名 URL，`file` / `mixed` = 代理读），
+/// 不必先发一个必然 501 的 `:presign`。
 fn health_body(service: &EvidenceService) -> serde_json::Value {
+    let backends = service.backends();
     let mut body = json!({
         "status": "ok",
-        "objects": { "kind": service.objects_backend().as_str() },
+        "objects": { "kind": backends.objects_kind() },
+        // 客户清单永远回显：没有默认后端，现场靠它确认「这个 cust_id 有没有登记」。
+        "cells": backends.describe(),
     });
-    // 多客户部署：把已登记的客户列出来（不包含 default）。
-    // 现场用它一眼区分“数据落进 default”还是“落进该客户的库”。
-    let backends = service.backends();
-    if backends.is_multi() {
-        body["cells"] = json!(backends.cell_ids());
-    }
     if let Some(probe) = service.probe_status() {
         body["probe"] = serde_json::to_value(probe).unwrap_or(serde_json::Value::Null);
     }
