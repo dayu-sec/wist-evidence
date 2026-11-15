@@ -81,6 +81,8 @@ pub async fn list_evidence(
         subject_id: query.subject_id.filter(|value| !value.is_empty()),
         command_id: query.cmd_id.filter(|value| !value.is_empty()),
         since,
+        // 探针行由服务层统一排除（见 `EvidenceService::list`）。
+        exclude_subject: None,
     };
     let tenant = query.tenant.unwrap_or(fallback_tenant);
     match state

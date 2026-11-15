@@ -39,6 +39,11 @@ pub struct ListFilter {
     /// 调查命令 id：发起调查的人手里只有这个，也是页面上最自然的入口。
     pub command_id: Option<String>,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// 要**排除**的主体：自检探针（`_probe`）写的行不是证据。
+    ///
+    /// 必须在查询层排除（而不是取完一页再跳过）：探针 5 分钟一条，
+    /// 后过滤会让它占满第一页，真正的证据一条都进不来。
+    pub exclude_subject: Option<String>,
 }
 
 /// 窗口内的接收计数（看板用）：索引表在 `stored_at` 上的聚合。
@@ -92,12 +97,27 @@ pub trait Index: Send + Sync {
 
     async fn insert(&self, artifact: &Artifact) -> Result<(), IndexError>;
 
-    /// 窗口内的接收计数（看板用）。`since` 之前的不算。
+    /// 窗口内的接收计数（看板用）。`since` 之前的不算；
+    /// `exclude_subject` 给自检探针用 —— 探针不是「数据进来了」。
     async fn stats(
         &self,
         tenant_id: &str,
         since: chrono::DateTime<chrono::Utc>,
+        exclude_subject: Option<&str>,
     ) -> Result<IndexStats, IndexError>;
+
+    /// `before` 之前、某个主体的行（按时间升序，清理用）。
+    ///
+    /// 为什么要单独一个方法：清理不能「取最新一页、里面没有过期行就收工」——
+    /// 探针 5 分钟一条，200 条只覆盖 16 小时，永远盖不到 24 小时保留期的边界，
+    /// 于是过期行一行也删不掉（只增不减）。从**最旧**端取就没有这个问题。
+    async fn expired(
+        &self,
+        tenant_id: &str,
+        subject_id: &str,
+        before: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<Artifact>, IndexError>;
 
     /// 同键新内容：更新当前行指向新对象，`artifact_id` 不变（它代表"这次动作的产物"）。
     async fn update(&self, artifact: &Artifact) -> Result<(), IndexError>;
@@ -145,11 +165,15 @@ impl Index for MemoryIndex {
         &self,
         tenant_id: &str,
         since: chrono::DateTime<chrono::Utc>,
+        exclude_subject: Option<&str>,
     ) -> Result<IndexStats, IndexError> {
         let rows = self.rows.read().expect("memory index poisoned");
         let mut stats = IndexStats::default();
         for row in rows.values() {
             if row.tenant_id != tenant_id || row.stored_at < since {
+                continue;
+            }
+            if exclude_subject.is_some_and(|hidden| row.subject_id == hidden) {
                 continue;
             }
             stats.received += 1;
@@ -159,6 +183,29 @@ impl Index for MemoryIndex {
             });
         }
         Ok(stats)
+    }
+
+    async fn expired(
+        &self,
+        tenant_id: &str,
+        subject_id: &str,
+        before: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<Artifact>, IndexError> {
+        let rows = self.rows.read().expect("memory index poisoned");
+        let mut matched: Vec<Artifact> = rows
+            .values()
+            .filter(|row| {
+                row.tenant_id == tenant_id
+                    && row.subject_id == subject_id
+                    && row.reported_at < before
+            })
+            .cloned()
+            .collect();
+        // 从**最旧**端取：每次都能推进，不会像「取最新一页」那样卡在保留期边界上。
+        matched.sort_by_key(|row| (row.reported_at, row.stored_at));
+        matched.truncate(limit);
+        Ok(matched)
     }
 
     async fn find_by_dedupe(
@@ -257,6 +304,12 @@ impl Index for MemoryIndex {
                     .is_none_or(|command| row.command_id.as_deref() == Some(command))
             })
             .filter(|row| filter.since.is_none_or(|since| row.reported_at >= since))
+            .filter(|row| {
+                filter
+                    .exclude_subject
+                    .as_deref()
+                    .is_none_or(|hidden| row.subject_id != hidden)
+            })
             .cloned()
             .collect();
         matched.sort_by_key(|row| std::cmp::Reverse(row.reported_at));
@@ -411,13 +464,16 @@ mod pg {
             &self,
             tenant_id: &str,
             since: DateTime<Utc>,
+            exclude_subject: Option<&str>,
         ) -> Result<IndexStats, IndexError> {
             let row: (i64, Option<DateTime<Utc>>) = sqlx::query_as(
                 "select count(*), max(stored_at) from evidence_artifact \
-                 where tenant_id = $1 and stored_at >= $2",
+                 where tenant_id = $1 and stored_at >= $2 \
+                   and ($3::text is null or subject_id <> $3)",
             )
             .bind(tenant_id)
             .bind(since)
+            .bind(exclude_subject)
             .fetch_one(&self.pool)
             .await
             .map_err(|err| IndexError::Backend(format!("stats: {err}")))?;
@@ -425,6 +481,34 @@ mod pg {
                 received: row.0.max(0) as u64,
                 last_stored_at: row.1,
             })
+        }
+
+        async fn expired(
+            &self,
+            tenant_id: &str,
+            subject_id: &str,
+            before: DateTime<Utc>,
+            limit: usize,
+        ) -> Result<Vec<Artifact>, IndexError> {
+            sqlx::query_as::<_, Row>(
+                "select artifact_id, tenant_id, customer_id, kind, subtype, subject_type, \
+                 subject_id, gateway_id, agent_id, command_id, dedupe_key, schema_id, sensitivity, \
+                 retention_class, bucket, object_key, size_bytes, sha256, verdict, marker_ids, \
+                 source_ref, source_sha256, durability, reported_at, stored_at, retention_until, \
+                 legal_hold, state \
+                 from evidence_artifact \
+                 where tenant_id = $1 and subject_id = $2 and reported_at < $3 \
+                 order by reported_at asc \
+                 limit $4",
+            )
+            .bind(tenant_id)
+            .bind(subject_id)
+            .bind(before)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.into_iter().map(Artifact::from).collect())
+            .map_err(|err| IndexError::Backend(format!("expired artifacts: {err}")))
         }
 
         async fn find_by_dedupe(
@@ -526,14 +610,16 @@ mod pg {
                and ($3::text is null or subject_id = $3) \
                and ($4::timestamptz is null or reported_at >= $4) \
                and ($5::text is null or command_id = $5) \
+               and ($6::text is null or subject_id <> $6) \
              order by reported_at desc \
-             limit $6 offset $7",
+             limit $7 offset $8",
             )
             .bind(tenant_id)
             .bind(filter.kind.map(|kind| kind.as_str()))
             .bind(filter.subject_id.as_deref())
             .bind(filter.since)
             .bind(filter.command_id.as_deref())
+            .bind(filter.exclude_subject.as_deref())
             .bind(limit as i64)
             .bind(offset)
             .fetch_all(&self.pool)

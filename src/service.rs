@@ -441,7 +441,10 @@ impl EvidenceService {
         };
 
         // 写成功了才计：重投（duplicate）在前面已经 return，什么都没写。
-        self.ingest.record(&w.customer_id, now);
+        // 自检探针不算：它是服务自己写的，看板要回答的是「外面的数据有没有进来」。
+        if w.subject_id != PROBE_SUBJECT {
+            self.ingest.record(&w.customer_id, now);
+        }
 
         Ok(WriteOutcome {
             artifact_id,
@@ -487,6 +490,7 @@ impl EvidenceService {
                     .stats(
                         tenant_id,
                         DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_default(),
+                        Some(PROBE_SUBJECT),
                     )
                     .await
                     .map_err(|err| ReadError::Backend(err.to_string()))?,
@@ -522,7 +526,7 @@ impl EvidenceService {
         };
         backend
             .index
-            .stats(tenant_id, Utc::now() - window)
+            .stats(tenant_id, Utc::now() - window, Some(PROBE_SUBJECT))
             .await
             .map_err(|err| ReadError::Backend(err.to_string()))
     }
@@ -539,6 +543,12 @@ impl EvidenceService {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<ListPage, ReadError> {
+        // 探针行在**查询层**排除（不是取到一页之后再跳过）：5 分钟一条，后过滤会把它
+        // 顶满第一页，真证据一条都进不来。调用方也不该能把它关掉 —— 那不是证据。
+        let filter = ListFilter {
+            exclude_subject: Some(PROBE_SUBJECT.to_string()),
+            ..filter.clone()
+        };
         if !principal
             .tenant_ids
             .iter()
@@ -557,7 +567,7 @@ impl EvidenceService {
         };
         let rows = backend
             .index
-            .list(tenant_id, filter, limit + 1, cursor)
+            .list(tenant_id, &filter, limit + 1, cursor)
             .await
             .map_err(|err| ReadError::Backend(err.to_string()))?;
 
@@ -684,37 +694,31 @@ impl EvidenceService {
 
     /// 清掉超过保留期的探针产物（对象 + 索引行），返回清除条数。
     /// 只动 `subject_id = _probe` 的行，不碰真证据。
+    ///
+    /// 取的是**最旧**的那批（`Index::expired`）：以前是「取最新一页、页内没有过期行就收工」，
+    /// 而探针 5 分钟一条、一页 `MAX_LIST_LIMIT` 条只覆盖十几个小时，永远够不到 24 小时的
+    /// 保留期边界 —— 于是过期行一行也删不掉，探针行只增不减，最后把真证据挤出第一页。
     pub async fn purge_probes(
         &self,
         tenant_id: &str,
         retention: Duration,
     ) -> Result<u64, ReadError> {
-        let cutoff = Utc::now() - chrono::Duration::from_std(retention).unwrap_or_default();
-        let filter = ListFilter {
-            kind: None,
-            subject_id: Some(PROBE_SUBJECT.to_string()),
-            command_id: None,
-            since: None,
-        };
-        let mut purged = 0u64;
         // 探针清理也跟客户走：探针写在哪个后端就清哪个后端；未登记客户没有可清的。
         let Some(backend) = self.backends.for_tenant(tenant_id) else {
             return Ok(0);
         };
+        let cutoff = Utc::now() - chrono::Duration::from_std(retention).unwrap_or_default();
+        let mut purged = 0u64;
         loop {
             let rows = backend
                 .index
-                .list(tenant_id, &filter, MAX_LIST_LIMIT, None)
+                .expired(tenant_id, PROBE_SUBJECT, cutoff, MAX_LIST_LIMIT)
                 .await
                 .map_err(|err| ReadError::Backend(err.to_string()))?;
             if rows.is_empty() {
                 break;
             }
-            let mut deleted = 0u64;
             for row in &rows {
-                if row.reported_at >= cutoff {
-                    continue;
-                }
                 // 先对象、后行：对象删失败就留着行，下次还能重试；反过来会留孤儿对象。
                 backend
                     .objects
@@ -726,11 +730,7 @@ impl EvidenceService {
                     .delete(tenant_id, &row.artifact_id)
                     .await
                     .map_err(|err| ReadError::Backend(err.to_string()))?;
-                deleted += 1;
-            }
-            purged += deleted;
-            if deleted == 0 || rows.len() < MAX_LIST_LIMIT {
-                break;
+                purged += 1;
             }
         }
         if let Some(probe) = &self.probe {

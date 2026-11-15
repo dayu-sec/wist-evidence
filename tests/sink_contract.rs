@@ -254,6 +254,21 @@ async fn list(
     )
 }
 
+/// 统计端点（看板的两个数）：`query` 形如 `?window_seconds=0`。
+async fn stats(read: &Router, tenant: &str, query: &str) -> Value {
+    let request = Request::builder()
+        .uri(format!("/internal/evidence/stats{query}"))
+        .header("x-evidence-tenant", tenant)
+        .header("x-evidence-scopes", "evidence:read")
+        .header("x-evidence-max-sensitivity", "commandlines")
+        .body(Body::empty())
+        .unwrap();
+    let response = read.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+}
+
 async fn presign(read: &Router, artifact_id: &str, ttl: u64) -> (StatusCode, Value) {
     let request = Request::builder()
         .method("POST")
@@ -1162,6 +1177,76 @@ async fn probe_artifacts_are_hidden_from_the_list() {
     // 探针每 5 分钟一条，不能污染人的列表。
     assert_eq!(artifacts.len(), 1, "{body}");
     assert_eq!(artifacts[0]["command_id"], "cmd-list-1");
+}
+
+/// 探针行再新，也不能把真证据挤出第一页（`limit` 就是页面大小）。
+#[tokio::test]
+async fn probe_rows_do_not_hide_real_evidence() {
+    let h = probe_harness();
+    let runner = probe_runner(&h).await;
+
+    post_record(&h.sink, record("cmd-real-1", "ok")).await;
+    // 探针比真证据新：按时间倒序，它本来就该排在前面。
+    for _ in 0..3 {
+        runner.tick().await.expect("probe");
+    }
+
+    let (status, page) = list(&h.read, CUST, "paths", "?limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let artifacts = page["artifacts"].as_array().expect("artifacts");
+    assert_eq!(artifacts.len(), 1, "探针占满页面就能让真证据消失：{page}");
+    assert_eq!(artifacts[0]["command_id"], "cmd-real-1");
+}
+
+/// 看板的两个数都只算真证据：探针不是「数据进来了」。
+#[tokio::test]
+async fn stats_ignore_probe_writes() {
+    let h = probe_harness();
+    let runner = probe_runner(&h).await;
+
+    post_record(&h.sink, record("cmd-real-stats", "ok")).await;
+    runner.tick().await.expect("probe");
+
+    let body = stats(&h.read, CUST, "?window_seconds=0").await;
+    assert_eq!(body["total"], 1, "累计量不该把自检算进来：{body}");
+    assert!(body["received"].is_null(), "{body}");
+
+    let body = stats(&h.read, CUST, "?window_seconds=3600").await;
+    assert_eq!(body["received"], 1, "窗口量同样不该算探针：{body}");
+}
+
+/// 清理要能翻过「最新一页」：过期的是最老那条，而后面还有整整一页新鲜的。
+#[tokio::test]
+async fn purge_reaches_expired_probes_beyond_the_newest_page() {
+    let h = probe_harness();
+    let address = spawn_router(h.sink.clone()).await;
+    // 只投一个客户，把「一页 = 200 条」撑满即可复现。
+    let runner = ProbeRunner::new(
+        h.service.clone(),
+        ProbeTarget {
+            url: format!("http://{address}/internal/evidence"),
+        },
+        vec![CUST.to_string()],
+        std::time::Duration::from_secs(300),
+        std::time::Duration::from_secs(24 * 3600),
+    );
+
+    runner.tick().await.expect("first probe");
+    // 让第一条跨过保留期，其余 200 条都还新鲜（一页装得下）。
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    for _ in 0..200 {
+        runner.tick().await.expect("probe");
+    }
+    assert_eq!(h.index.len(), 201);
+
+    let purged = h
+        .service
+        .purge_probes(CUST, std::time::Duration::from_secs(1))
+        .await
+        .expect("purge");
+
+    assert_eq!(purged, 1, "最老那条必须被清掉");
+    assert_eq!(h.index.len(), 200, "新鲜的探针一条都不能动");
 }
 
 #[tokio::test]
