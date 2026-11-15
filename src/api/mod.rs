@@ -53,6 +53,8 @@ pub fn read_router(state: ReadState) -> Router {
     Router::new()
         .route("/healthz", get(read_healthz))
         .route("/internal/evidence", get(read::list_evidence))
+        // 看板：窗口内落库条数（静态段优先于下面的 `{key}`，不会撞车）。
+        .route("/internal/evidence/stats", get(read::stats))
         // `{key}` 可以是证据 id（`art_…`）或调查命令 id（`cmd_id`）：
         // 发起调查的人手里只有后一个（见 `EvidenceService::find_visible`）。
         .route(

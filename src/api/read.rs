@@ -99,6 +99,52 @@ pub async fn list_evidence(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct StatsQuery {
+    /// 统计窗口（秒）；缺省 1 小时，夹到 60 秒 ~ 24 小时。
+    #[serde(default)]
+    pub window_seconds: Option<i64>,
+    /// 可选：显式指定租户；缺省用调用方身份里的第一个。
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+/// `GET /internal/evidence/stats?window_seconds=` — 窗口内落库条数 + 最后一条时间。
+///
+/// 给看板回答“数据有没有进来”的：探活只证明端口通，不证明有数据。
+/// 只回聚合值（条数与最后时间），不回任何内容 —— 这个端点不进浏览器直连面。
+pub async fn stats(
+    State(state): State<ReadState>,
+    headers: HeaderMap,
+    Query(query): Query<StatsQuery>,
+) -> Response {
+    let principal = match principal_from_headers(&state, &headers) {
+        Some(principal) => principal,
+        None => return unauthorized(),
+    };
+    let Some(fallback_tenant) = principal.tenant_ids.first().cloned() else {
+        return unauthorized();
+    };
+    let tenant = query
+        .tenant
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_tenant);
+    let window = query.window_seconds.unwrap_or(3_600).clamp(60, 86_400);
+    match state
+        .service
+        .stats(&principal, &tenant, chrono::Duration::seconds(window))
+        .await
+    {
+        Ok(stats) => Json(serde_json::json!({
+            "window_seconds": window,
+            "received": stats.received,
+            "last_at_ms": stats.last_stored_at.map(|at| at.timestamp_millis()),
+        }))
+        .into_response(),
+        Err(error) => read_error_response(error),
+    }
+}
+
 fn bad_request(code: &str, message: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,

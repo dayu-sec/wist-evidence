@@ -627,6 +627,32 @@ async fn file_backend_supersede_keeps_the_old_object() {
 }
 
 #[tokio::test]
+async fn stats_counts_records_inside_the_window() {
+    let dir = TempDirGuard::new("stats");
+    let h = file_harness(dir.path());
+    post_record(&h.sink, record("cmd-stats-1", "ok")).await;
+    post_record(&h.sink, record("cmd-stats-2", "ok")).await;
+
+    let request = Request::builder()
+        .uri("/internal/evidence/stats?window_seconds=3600")
+        .header("x-evidence-tenant", CUST)
+        .header("x-evidence-scopes", "evidence:read")
+        .header("x-evidence-max-sensitivity", "commandlines")
+        .body(Body::empty())
+        .unwrap();
+    let response = h.read.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(body["received"], 2, "{body}");
+    assert!(
+        body["last_at_ms"].as_i64().is_some(),
+        "没有最后一条时间，看板就分不出「没数据」和「断了」：{body}"
+    );
+}
+
+#[tokio::test]
 async fn file_backend_presign_returns_501() {
     let dir = TempDirGuard::new("presign");
     let h = file_harness(dir.path());

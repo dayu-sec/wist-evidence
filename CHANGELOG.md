@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 0.3.1 · 2026-11-15
+
+- **新增 `GET /internal/evidence/stats?window_seconds=`（看板用）**：返回窗口内落库条数与
+  最后一条的 `stored_at`（`{received, last_at_ms}`）。看板要回答的是「数据有没有进来」，
+  而探活只证明端口通。不返回任何正文；按调用方身份里的租户聚合，未登记租户给全 0
+  （与列表同一个口径，不泄露存在性）。索引两端（`memory` / `postgres`）都实现了同一个
+  `count(*) + max(stored_at)`，不需要翻页凑数。
+
 ## 0.3.0-alpha · 2026-11-12
 
 **不向后兼容**：默认存储后端已移除。旧配置必须把顶层 `[index]` / `[objects]`

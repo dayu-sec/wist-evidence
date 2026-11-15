@@ -41,6 +41,16 @@ pub struct ListFilter {
     pub since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// 窗口内的接收计数（看板用）：索引表在 `stored_at` 上的聚合。
+///
+/// 只算**已入库的行**（每行 = 一份产物 = 数据面发来的一条），不区分 kind：
+/// 看板要回答的是“有没有数据进来”，不是“进来的是哪类”。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexStats {
+    pub received: u64,
+    pub last_stored_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[async_trait]
 pub trait Index: Send + Sync {
     /// 索引类型（自述用，`/healthz` 的客户清单里会用到）：`memory` / `postgres`。
@@ -82,6 +92,13 @@ pub trait Index: Send + Sync {
 
     async fn insert(&self, artifact: &Artifact) -> Result<(), IndexError>;
 
+    /// 窗口内的接收计数（看板用）。`since` 之前的不算。
+    async fn stats(
+        &self,
+        tenant_id: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<IndexStats, IndexError>;
+
     /// 同键新内容：更新当前行指向新对象，`artifact_id` 不变（它代表"这次动作的产物"）。
     async fn update(&self, artifact: &Artifact) -> Result<(), IndexError>;
 
@@ -122,6 +139,26 @@ impl MemoryIndex {
 impl Index for MemoryIndex {
     fn kind(&self) -> &'static str {
         "memory"
+    }
+
+    async fn stats(
+        &self,
+        tenant_id: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<IndexStats, IndexError> {
+        let rows = self.rows.read().expect("memory index poisoned");
+        let mut stats = IndexStats::default();
+        for row in rows.values() {
+            if row.tenant_id != tenant_id || row.stored_at < since {
+                continue;
+            }
+            stats.received += 1;
+            stats.last_stored_at = Some(match stats.last_stored_at {
+                Some(current) if current >= row.stored_at => current,
+                _ => row.stored_at,
+            });
+        }
+        Ok(stats)
     }
 
     async fn find_by_dedupe(
@@ -270,7 +307,7 @@ mod pg {
         Artifact, ArtifactState, Durability, Kind, RetentionClass, Sensitivity, Verdict,
     };
 
-    use super::{Index, IndexError, ListFilter};
+    use super::{Index, IndexError, IndexStats, ListFilter};
 
     #[derive(Debug)]
     pub struct PgIndex {
@@ -368,6 +405,26 @@ mod pg {
     impl Index for PgIndex {
         fn kind(&self) -> &'static str {
             "postgres"
+        }
+
+        async fn stats(
+            &self,
+            tenant_id: &str,
+            since: DateTime<Utc>,
+        ) -> Result<IndexStats, IndexError> {
+            let row: (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+                "select count(*), max(stored_at) from evidence_artifact \
+                 where tenant_id = $1 and stored_at >= $2",
+            )
+            .bind(tenant_id)
+            .bind(since)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|err| IndexError::Backend(format!("stats: {err}")))?;
+            Ok(IndexStats {
+                received: row.0.max(0) as u64,
+                last_stored_at: row.1,
+            })
         }
 
         async fn find_by_dedupe(

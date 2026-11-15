@@ -393,6 +393,30 @@ impl EvidenceService {
     ///
     /// 过滤顺序是「先按索引取，再按可见性筛」：为了少查一次，按 `limit + 1` 取，
     /// 被敏感度/状态筛掉的行不占配额（代价是 `next_cursor` 可能比实际返回更靠后）。
+    pub async fn stats(
+        &self,
+        principal: &ReadPrincipal,
+        tenant_id: &str,
+        window: chrono::Duration,
+    ) -> Result<crate::infra::index::IndexStats, ReadError> {
+        if !principal
+            .tenant_ids
+            .iter()
+            .any(|tenant| tenant == tenant_id)
+        {
+            return Err(ReadError::NotFound);
+        }
+        // 未登记租户不泄露存在性：统计就是全 0（与列表同一个口径）。
+        let Some(backend) = self.backends.for_tenant(tenant_id) else {
+            return Ok(crate::infra::index::IndexStats::default());
+        };
+        backend
+            .index
+            .stats(tenant_id, Utc::now() - window)
+            .await
+            .map_err(|err| ReadError::Backend(err.to_string()))
+    }
+
     pub async fn list(
         &self,
         principal: &ReadPrincipal,
