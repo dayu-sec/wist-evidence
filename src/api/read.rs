@@ -129,20 +129,35 @@ pub async fn stats(
         .tenant
         .filter(|value| !value.is_empty())
         .unwrap_or(fallback_tenant);
-    let window = query.window_seconds.unwrap_or(3_600).clamp(60, 86_400);
-    match state
-        .service
-        .stats(&principal, &tenant, chrono::Duration::seconds(window))
-        .await
-    {
-        Ok(stats) => Json(serde_json::json!({
-            "window_seconds": window,
-            "received": stats.received,
-            "last_at_ms": stats.last_stored_at.map(|at| at.timestamp_millis()),
-        }))
-        .into_response(),
-        Err(error) => read_error_response(error),
-    }
+    // `window_seconds=0` = 只看累计，不算窗口：看板实时轮询走这条（不做 count）。
+    let window = query.window_seconds.unwrap_or(3_600);
+    let windowed = if window <= 0 {
+        None
+    } else {
+        let window = window.clamp(60, 86_400);
+        match state
+            .service
+            .stats(&principal, &tenant, chrono::Duration::seconds(window))
+            .await
+        {
+            Ok(stats) => Some((window, stats)),
+            Err(error) => return read_error_response(error),
+        }
+    };
+    // 累计数走进程内计数器（O(1)），不跟窗口 count 混在一起。
+    let totals = match state.service.ingest_totals(&principal, &tenant).await {
+        Ok(totals) => totals,
+        Err(error) => return read_error_response(error),
+    };
+    Json(serde_json::json!({
+        "window_seconds": windowed.map(|(window, _)| window),
+        "received": windowed.map(|(_, stats)| stats.received),
+        "total": totals.total,
+        "last_at_ms": totals
+            .last_at_ms
+            .or_else(|| windowed.and_then(|(_, stats)| stats.last_stored_at.map(|at| at.timestamp_millis()))),
+    }))
+    .into_response()
 }
 
 fn bad_request(code: &str, message: &str) -> Response {

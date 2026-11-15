@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 0.3.2 · 2026-11-15
+
+- **`/internal/evidence/stats` 加上 `total`（累计写入条数）**：看板要秒级刷新，而每次都
+  `count(*)` 会随表长变成反复扫表。改成进程内按租户的计数器：写成功 +1、记最后一次写入
+  时间，读只读两个原子量；每个租户**第一次读**用一次 `count(*)` 对齐基线（取 `max`，
+  不抹掉刚计过的写）。响应变成 `{window_seconds, received, total, last_at_ms}`。
+- **`window_seconds=0` = 只看累计**：不算窗口、不做 count（`window_seconds` / `received`
+  为 null）。概览页的实时轮询走这条。
+- 计数只认真正写进去的行：重投（duplicate）不计。
+
 ## 0.3.1 · 2026-11-15
 
 - **新增 `GET /internal/evidence/stats?window_seconds=`（看板用）**：返回窗口内落库条数与

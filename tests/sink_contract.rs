@@ -652,6 +652,37 @@ async fn stats_counts_records_inside_the_window() {
     );
 }
 
+/// `window_seconds=0` = 看板实时轮询：只回累计与最后一次，不做窗口 count。
+#[tokio::test]
+async fn stats_without_a_window_reports_the_cumulative_total() {
+    let dir = TempDirGuard::new("stats-total");
+    let h = file_harness(dir.path());
+    post_record(&h.sink, record("cmd-total-1", "ok")).await;
+    post_record(&h.sink, record("cmd-total-2", "ok")).await;
+    // 重投不算第二次写：它什么都没落库。
+    post_record(&h.sink, record("cmd-total-2", "ok")).await;
+
+    let request = Request::builder()
+        .uri("/internal/evidence/stats?window_seconds=0")
+        .header("x-evidence-tenant", CUST)
+        .header("x-evidence-scopes", "evidence:read")
+        .header("x-evidence-max-sensitivity", "commandlines")
+        .body(Body::empty())
+        .unwrap();
+    let response = h.read.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(body["total"], 2, "{body}");
+    assert!(
+        body["received"].is_null(),
+        "window=0 不该再算窗口量：{body}"
+    );
+    assert!(body["window_seconds"].is_null(), "{body}");
+    assert!(body["last_at_ms"].as_i64().is_some(), "{body}");
+}
+
 #[tokio::test]
 async fn file_backend_presign_returns_501() {
     let dir = TempDirGuard::new("presign");

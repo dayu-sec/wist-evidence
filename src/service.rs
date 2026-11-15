@@ -5,7 +5,9 @@
 //! - §7.2 授权模型 —— [`EvidenceService::metadata`] / [`EvidenceService::presign`]
 //! - §5.2 对象元数据 —— 写入时一次性带齐七个自描述字段
 
-use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -117,6 +119,75 @@ pub struct EvidenceService {
     max_body_bytes: usize,
     /// `Some` = 写探针已启用（由启动流程调 `enable_probe`）；`None` = 没开。
     probe: Option<Arc<RwLock<ProbeStatus>>>,
+    /// 看板用的写入计数（累计 + 最后一次），读取是 O(1)。
+    ingest: Arc<IngestCounter>,
+}
+
+/// 一个租户的写入计数。
+#[derive(Debug, Default)]
+struct TenantIngest {
+    total: AtomicU64,
+    last_at_ms: AtomicI64,
+    /// 基线是否已经用库里的一行数对齐过（见 `ingest_totals`）。
+    seeded: AtomicBool,
+}
+
+/// 进程内的写入计数：看板要「累计写入条数 + 最后一次写入时间」。
+///
+/// 为什么不在每次请求里 `count(*)`：那张表一直在长，秒级轮询会变成反复扫表。
+/// 这里写成功就 +1，读只读两个原子量；进程重启后第一次读会用一次 `count(*)` 重新对齐基线。
+#[derive(Debug, Default)]
+pub struct IngestCounter {
+    per_tenant: Mutex<HashMap<String, Arc<TenantIngest>>>,
+}
+
+impl IngestCounter {
+    fn tenant(&self, tenant_id: &str) -> Arc<TenantIngest> {
+        let mut guard = self.per_tenant.lock().expect("ingest counter poisoned");
+        guard
+            .entry(tenant_id.to_string())
+            .or_insert_with(|| Arc::new(TenantIngest::default()))
+            .clone()
+    }
+
+    /// 写成功一次就记一次（重投不计：它什么都没写）。
+    fn record(&self, tenant_id: &str, at: DateTime<Utc>) {
+        let tenant = self.tenant(tenant_id);
+        tenant.total.fetch_add(1, Ordering::Relaxed);
+        let at_ms = at.timestamp_millis();
+        tenant.last_at_ms.fetch_max(at_ms, Ordering::Relaxed);
+    }
+
+    /// 用库里已有的一行数做基线（只在每个租户的第一次读取时做一次）。
+    ///
+    /// 基线取 `max(当前计数, 库里行数)`：计数器和 count 之间有一个极小的时间窗，
+    /// 取大值就不会把已经计过的写又抹掉。
+    fn seed(&self, tenant_id: &str, total: u64, last_at_ms: Option<i64>) {
+        let tenant = self.tenant(tenant_id);
+        tenant.total.fetch_max(total, Ordering::Relaxed);
+        if let Some(at_ms) = last_at_ms {
+            tenant.last_at_ms.fetch_max(at_ms, Ordering::Relaxed);
+        }
+        tenant.seeded.store(true, Ordering::Relaxed);
+    }
+
+    fn is_seeded(&self, tenant_id: &str) -> bool {
+        self.tenant(tenant_id).seeded.load(Ordering::Relaxed)
+    }
+
+    fn snapshot(&self, tenant_id: &str) -> (u64, Option<i64>) {
+        let tenant = self.tenant(tenant_id);
+        let total = tenant.total.load(Ordering::Relaxed);
+        let last = tenant.last_at_ms.load(Ordering::Relaxed);
+        (total, (last > 0).then_some(last))
+    }
+}
+
+/// 看板的「累计写入条数 + 最后一次写入时间」。
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct IngestTotals {
+    pub total: u64,
+    pub last_at_ms: Option<i64>,
 }
 
 /// **三字段形状**的写入请求：`cust_id` / `cmd_id` / `content`（`subject` 可选）。
@@ -169,6 +240,7 @@ impl EvidenceService {
             allowed_kinds,
             max_body_bytes,
             probe: None,
+            ingest: Arc::new(IngestCounter::default()),
         }
     }
 
@@ -368,6 +440,9 @@ impl EvidenceService {
             },
         };
 
+        // 写成功了才计：重投（duplicate）在前面已经 return，什么都没写。
+        self.ingest.record(&w.customer_id, now);
+
         Ok(WriteOutcome {
             artifact_id,
             durability: w.durability,
@@ -389,10 +464,45 @@ impl EvidenceService {
         Ok(artifact)
     }
 
-    /// 时间倒序列表。`tenant_id` 必须落在调用方的租户集合里。
+    /// 看板的「累计写入条数 + 最后一次写入时间」，读取是 O(1)。
     ///
-    /// 过滤顺序是「先按索引取，再按可见性筛」：为了少查一次，按 `limit + 1` 取，
-    /// 被敏感度/状态筛掉的行不占配额（代价是 `next_cursor` 可能比实际返回更靠后）。
+    /// 每个租户的第一次读会用一次 `count(*)` 对齐基线（进程重启后计数从 0 开始），
+    /// 之后只读进程内的两个原子量 —— 秒级轮询不会变成反复扫表。
+    pub async fn ingest_totals(
+        &self,
+        principal: &ReadPrincipal,
+        tenant_id: &str,
+    ) -> Result<IngestTotals, ReadError> {
+        if !principal
+            .tenant_ids
+            .iter()
+            .any(|tenant| tenant == tenant_id)
+        {
+            return Err(ReadError::NotFound);
+        }
+        if !self.ingest.is_seeded(tenant_id) {
+            let baseline = match self.backends.for_tenant(tenant_id) {
+                Some(backend) => backend
+                    .index
+                    .stats(
+                        tenant_id,
+                        DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_default(),
+                    )
+                    .await
+                    .map_err(|err| ReadError::Backend(err.to_string()))?,
+                None => crate::infra::index::IndexStats::default(),
+            };
+            self.ingest.seed(
+                tenant_id,
+                baseline.received,
+                baseline.last_stored_at.map(|at| at.timestamp_millis()),
+            );
+        }
+        let (total, last_at_ms) = self.ingest.snapshot(tenant_id);
+        Ok(IngestTotals { total, last_at_ms })
+    }
+
+    /// 某租户在 `window` 里的落库条数与最后一条时间（看板「窗口内」那一栏用）。
     pub async fn stats(
         &self,
         principal: &ReadPrincipal,
@@ -417,6 +527,10 @@ impl EvidenceService {
             .map_err(|err| ReadError::Backend(err.to_string()))
     }
 
+    /// 时间倒序列表。`tenant_id` 必须落在调用方的租户集合里。
+    ///
+    /// 过滤顺序是「先按索引取，再按可见性筛」：为了少查一次，按 `limit + 1` 取，
+    /// 被敏感度/状态筛掉的行不占配额（代价是 `next_cursor` 可能比实际返回更靠后）。
     pub async fn list(
         &self,
         principal: &ReadPrincipal,
@@ -732,5 +846,36 @@ fn store_error(err: StoreError) -> WriteError {
             WriteError::BadRequest("evidence_write_unsupported")
         }
         StoreError::Backend(message) => WriteError::Backend(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 计数器的两条不变量：写一次加一次；对齐基线只往上抬，不把已计过的写抹掉。
+    #[test]
+    fn ingest_counter_never_loses_writes_or_the_baseline() {
+        let counter = IngestCounter::default();
+        assert_eq!(counter.snapshot("t-1"), (0, None));
+
+        let first = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("valid");
+        let second = DateTime::<Utc>::from_timestamp(1_700_000_042, 0).expect("valid");
+        counter.record("t-1", second);
+        counter.record("t-1", first);
+        assert_eq!(
+            counter.snapshot("t-1"),
+            (2, Some(1_700_000_042_000)),
+            "最后一次时间取最大值，写序不依赖调用顺序"
+        );
+
+        // 进程重启后的基线：库里已经有 10 行，计数不能被抹回 2。
+        counter.seed("t-1", 10, Some(1_600_000_000_000));
+        assert!(counter.is_seeded("t-1"));
+        assert_eq!(counter.snapshot("t-1"), (10, Some(1_700_000_042_000)));
+
+        // 对齐基线之后再写：从基线往上加。
+        counter.record("t-1", second);
+        assert_eq!(counter.snapshot("t-1").0, 11);
     }
 }
