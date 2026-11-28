@@ -8,12 +8,16 @@ use anyhow::Context;
 use wist_evidence::api::{self, ReadState, SinkState};
 use wist_evidence::config::{Config, IndexKind, ObjectsKind};
 use wist_evidence::infra::FileObjectStore;
+use wist_evidence::infra::FlowStore;
 use wist_evidence::infra::Index;
+use wist_evidence::infra::MemoryFlowStore;
 use wist_evidence::infra::MemoryIndex;
 use wist_evidence::infra::ObjectStore;
 use wist_evidence::probe::{self, ProbeRunner, ProbeTarget};
 use wist_evidence::service::EvidenceService;
 
+#[cfg(feature = "pg")]
+use wist_evidence::infra::PgFlowStore;
 #[cfg(feature = "pg")]
 use wist_evidence::infra::PgIndex;
 #[cfg(feature = "s3")]
@@ -140,9 +144,11 @@ async fn main() -> anyhow::Result<()> {
 async fn build_backends(config: &Config) -> anyhow::Result<Arc<wist_evidence::infra::Backends>> {
     let mut cells = std::collections::BTreeMap::new();
     for cell in &config.cells {
+        let (index, flows) = build_stores(&cell.index).await?;
         let backend = wist_evidence::infra::Backend {
-            index: build_index(&cell.index).await?,
+            index,
             objects: build_objects(&cell.objects)?,
+            flows,
             bucket: cell.objects.bucket.clone(),
         };
         cells.insert(cell.cust_id.clone(), backend);
@@ -152,11 +158,18 @@ async fn build_backends(config: &Config) -> anyhow::Result<Arc<wist_evidence::in
     Ok(Arc::new(wist_evidence::infra::Backends::new(cells)))
 }
 
-async fn build_index(
+/// 一个客户的索引 + 流记录存储。
+///
+/// 两者在 PG 下**共享同一个连接池**：`flow_window` 与索引表在同一个客户库里，
+/// 每个客户再开一套池只会把 `max_connections` 倍乘上去，而不多给任何隔离。
+async fn build_stores(
     config: &wist_evidence::config::IndexConfig,
-) -> anyhow::Result<Arc<dyn Index>> {
+) -> anyhow::Result<(Arc<dyn Index>, Arc<dyn FlowStore>)> {
     match config.kind {
-        IndexKind::Memory => Ok(Arc::new(MemoryIndex::new())),
+        IndexKind::Memory => Ok((
+            Arc::new(MemoryIndex::new()),
+            Arc::new(MemoryFlowStore::new()),
+        )),
         IndexKind::Postgres => {
             #[cfg(feature = "pg")]
             {
@@ -166,10 +179,13 @@ async fn build_index(
                     .context("index.database_url is required for postgres")?;
                 let index = PgIndex::connect(url).await?;
                 index.migrate().await?;
-                Ok(Arc::new(index))
+                // 迁移会建 `flow_window`（0003），所以 flow store 可以复用这个池。
+                let flows = PgFlowStore::from_pool(index.pool().clone());
+                Ok((Arc::new(index), Arc::new(flows)))
             }
             #[cfg(not(feature = "pg"))]
             {
+                let _ = config;
                 anyhow::bail!("built without the `pg` feature: cannot use index.kind = postgres")
             }
         }

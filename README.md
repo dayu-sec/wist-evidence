@@ -11,6 +11,7 @@
 | 能力 | 状态 |
 |---|---|
 | `POST /internal/evidence` sink 写入（单对象 / 数组、幂等） | ✅ |
+| `POST /internal/flows` 主机流记录批量写入（`flow_window` 天分区、`on conflict` 覆盖） | ✅ |
 | 索引写入（`(tenant, kind, subject, dedupe_key)` 唯一） | ✅ |
 | 对象写入（先对象后索引；7 个自描述元数据字段） | ✅ |
 | 对象存储：**本地目录** / **S3（COS / MinIO）** | ✅ |
@@ -36,6 +37,26 @@
 > 写端点**不能**和读端点共用端口：混在一起就得让读路径容忍"没有证书"的流量。
 
 ## 写入接口（数据面 / 脚本）
+
+### 主机流记录：`POST /internal/flows`
+
+主机流记录（`wist.host_flow/v1`）**不走** `/internal/evidence`：那条路径是「一产物一对象」，
+而流是每主机每 60s 每五元组一条（百万级/天）。两者落在**同一个客户库**，但表不同：
+
+```text
+POST /internal/flows
+{ "cust_id": "c-001", "records": [ { …HostFlowRecord… } ] }
+→ 200 { "accepted": 2, "partitions": 0 }
+```
+
+- 表：`flow_window`，按 `window_start` **天分区**，分区由写入端按需创建（`flow_window_pYYYYMMDD`）；
+- 幂等：唯一键 = 11 段业务键 + `tenant_id`，`on conflict do update`（**覆盖**，不累加）；
+- 限：单次 ≤ 4096 条 / body ≤ 4 MiB（超了就整批 400，**不截断**）；
+- 错误：字段不合法 / 客户未登记 / 批量超限 → 400 + `failures[]`；后端错 → 502（细节只进日志）。
+
+设计见 `wist-design/doc/design/center/agent-flow-storage.md`。
+
+### 证据：`POST /internal/evidence`
 
 ```text
 POST /internal/evidence

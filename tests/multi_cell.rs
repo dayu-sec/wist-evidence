@@ -10,7 +10,7 @@ use std::time::Duration;
 use wist_evidence::domain::Kind;
 use wist_evidence::domain::kind::Sensitivity;
 use wist_evidence::infra::{
-    Backend, Backends, FileObjectStore, ListFilter, MemoryIndex, MemoryObjectStore,
+    Backend, Backends, FileObjectStore, ListFilter, MemoryFlowStore, MemoryIndex, MemoryObjectStore,
 };
 use wist_evidence::service::{EvidenceService, ReadPrincipal, SimpleWrite, WriteError};
 
@@ -28,6 +28,7 @@ fn backend(index: Arc<MemoryIndex>) -> Backend {
     Backend {
         index,
         objects: Arc::new(MemoryObjectStore::new()),
+        flows: Arc::new(MemoryFlowStore::new()),
         bucket: "wist-evidence".to_string(),
     }
 }
@@ -185,6 +186,7 @@ fn objects_kind_is_mixed_when_cells_differ() {
         Backend {
             index: Arc::new(MemoryIndex::new()),
             objects: file,
+            flows: Arc::new(MemoryFlowStore::new()),
             bucket: "wist-evidence".to_string(),
         },
     );

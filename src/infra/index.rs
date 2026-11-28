@@ -384,6 +384,11 @@ mod pg {
                 .await
                 .map_err(|err| IndexError::Backend(format!("migrate: {err}")))
         }
+
+        /// 共享给同库的其他表（`flow_window`）：同一个客户库只应有一套连接池。
+        pub fn pool(&self) -> &PgPool {
+            &self.pool
+        }
     }
 
     #[derive(Debug, FromRow)]

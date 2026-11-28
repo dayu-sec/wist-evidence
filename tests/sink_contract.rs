@@ -16,8 +16,8 @@ use tower::ServiceExt;
 use wist_evidence::api::{self, ReadState, SinkState};
 use wist_evidence::domain::Kind;
 use wist_evidence::infra::{
-    Backend, Backends, FileObjectStore, MemoryIndex, MemoryObjectStore, ObjectBackend, ObjectMeta,
-    ObjectStore, StoreError,
+    Backend, Backends, FileObjectStore, MemoryFlowStore, MemoryIndex, MemoryObjectStore,
+    ObjectBackend, ObjectMeta, ObjectStore, StoreError,
 };
 use wist_evidence::service::EvidenceService;
 
@@ -104,6 +104,7 @@ fn harness_with(
     file: Option<Arc<FileObjectStore>>,
     probe_enabled: bool,
 ) -> Harness {
+    let flows = Arc::new(MemoryFlowStore::new());
     let mut raw_service = EvidenceService::with_backends(
         Arc::new(Backends::new(
             CUSTS
@@ -114,6 +115,7 @@ fn harness_with(
                         Backend {
                             index: index.clone(),
                             objects: objects.clone(),
+                            flows: flows.clone(),
                             bucket: "wist-evidence-test".to_string(),
                         },
                     )

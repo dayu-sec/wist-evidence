@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::infra::{Index, ObjectStore};
+use crate::infra::{FlowStore, Index, ObjectStore};
 
 /// 一个完整的存储后端：索引 + 对象 + 桶名。
 ///
@@ -21,6 +21,8 @@ use crate::infra::{Index, ObjectStore};
 pub struct Backend {
     pub index: Arc<dyn Index>,
     pub objects: Arc<dyn ObjectStore>,
+    /// 主机流记录的落点（`flow_window`）。与索引**同一个客户库**，但走不同的表与写路径。
+    pub flows: Arc<dyn FlowStore>,
     pub bucket: String,
 }
 
@@ -30,6 +32,9 @@ pub struct CellManifest {
     pub cust_id: String,
     pub index: &'static str,
     pub objects: &'static str,
+    /// 流记录的落点类型（`postgres` / `memory`）：现场看这个就能判断
+    /// 「是不是只落了内存、重启就没了」。
+    pub flows: &'static str,
 }
 
 /// 客户 → 后端的路由表。
@@ -52,6 +57,11 @@ impl Backends {
     /// 取某个客户的后端；未登记返回 `None`，由调用方决定是 4xx 还是当作不存在。
     pub fn for_tenant(&self, tenant: &str) -> Option<&Backend> {
         self.cells.get(tenant)
+    }
+
+    /// 取某个客户的流量存储；未登记返回 `None`（写路径回 400，不静默丢）。
+    pub fn flows_for(&self, tenant: &str) -> Option<&Arc<dyn FlowStore>> {
+        self.cells.get(tenant).map(|backend| &backend.flows)
     }
 
     /// 这个客户是否登记过。
@@ -99,6 +109,7 @@ impl Backends {
                 cust_id: cust_id.clone(),
                 index: backend.index.kind(),
                 objects: backend.objects.backend().as_str(),
+                flows: backend.flows.kind(),
             })
             .collect()
     }

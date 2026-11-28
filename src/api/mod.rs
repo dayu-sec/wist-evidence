@@ -7,6 +7,7 @@
 //! 两张面**不能共用端口**：混在一起就必须让写端点容忍一段"没有证书"的流量，
 //! 而那正是最容易被放大的授权漏洞。
 
+pub mod flows;
 pub mod read;
 pub mod sink;
 
@@ -20,6 +21,9 @@ use serde_json::json;
 
 use crate::domain::{Kind, Sensitivity};
 use crate::service::EvidenceService;
+
+/// 流记录写入的 body 上限：一拍 4096 条 × ~700B ≈ 2.8 MB（见设计稿 §4.4）。
+pub const FLOW_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// 写端点的状态：服务 + 三字段形状要用的部署默认值。
 #[derive(Clone)]
@@ -42,6 +46,12 @@ pub fn sink_router(state: SinkState, max_body_bytes: usize) -> Router {
     Router::new()
         .route("/healthz", get(sink_healthz))
         .route("/internal/evidence", post(sink::write_records))
+        // 主机流记录：批量、高频、**不走对象存储**（每窗一条小记录，见设计稿 §3 D4）。
+        // 上限单独定：一拍 4096 条 × ~700B ≈ 2.8 MB，4 MiB 留一倍余量。
+        .route(
+            "/internal/flows",
+            post(flows::write_flows).layer(DefaultBodyLimit::max(FLOW_MAX_BODY_BYTES)),
+        )
         // 上限比正文上限宽一点：外层记录把正文当字符串放，转义会膨胀（与网关 ingest 同口径）。
         .layer(DefaultBodyLimit::max(
             max_body_bytes.saturating_add(64 * 1024),
